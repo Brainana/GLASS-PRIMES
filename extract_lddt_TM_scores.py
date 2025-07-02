@@ -28,8 +28,10 @@ from tqdm import tqdm
 import csv
 import multiprocessing as mp
 from functools import partial
+from tmtools import tm_align
+from lddt import LDDTCalculator
 
-MAX_RESIDUES = 600
+MAX_PAIRS = 10  # Set to an integer to limit, or None to process all pairs
 
 # Try to import PyTorch for GPU acceleration
 try:
@@ -77,6 +79,8 @@ class LDDTExtractor:
         self.max_cache_size = 100  # Limit cache size to prevent memory issues
         
         print(f"Initialized LDDT extractor (UPDATED) for bucket: {bucket_name}")
+        # Initialize lDDT calculator
+        self.lddt_calculator = LDDTCalculator()
     
     def read_pdb_from_gcs(self, gcs_path: str) -> str:
         """
@@ -92,388 +96,109 @@ class LDDTExtractor:
         blob = self.bucket.blob(gcs_path)
         return blob.open('r')
     
-    def get_all_atom_coords_from_structure(self, structure_file) -> List[np.ndarray]:
-        """Extract all atom coordinates from structure, grouped by residue."""
-        parser = PDBParser(QUIET=True)
-        structure = parser.get_structure('structure', structure_file)
-        
-        residue_coords = []
-        for model in structure:
-            for chain in model:
-                for residue in chain:
-                    if 'CA' in residue:
-                        # Get all atom coordinates for this residue
-                        atom_coords = []
-                        for atom in residue:
-                            atom_coords.append(atom.get_coord())
-                        if atom_coords:  # Only add if residue has atoms
-                            residue_coords.append(np.array(atom_coords))
-                break
-        return residue_coords
-    
-    def get_lddt_scores_with_alignment(self, pdb1_gcs_path: str, pdb2_gcs_path: str, 
-                                     seqxA: str, seqyA: str, seqM: str) -> np.ndarray:
-        """
-        Get LDDT scores using provided alignment sequences.
-        Implements proper LDDT algorithm: calculate LDDT for aligned residues only.
-        
-        Args:
-            pdb1_gcs_path: GCS path to template PDB file (reference)
-            pdb2_gcs_path: GCS path to target PDB file (being evaluated)
-            seqxA: Aligned sequence A (template)
-            seqyA: Aligned sequence B (target)
-            seqM: Alignment annotation
-            
-        Returns:
-            Array with LDDT scores for aligned residues
-        """
-        # Get structures from cache or load them
-        template_residue_coords = self._get_cached_structure(pdb1_gcs_path)
-        target_residue_coords = self._get_cached_structure(pdb2_gcs_path)
-        
-        # Calculate LDDT scores for aligned residues
-        lddt_scores = self._calculate_lddt_with_alignment(
-            template_residue_coords, target_residue_coords, seqxA, seqyA, seqM
-        )
-        
-        return lddt_scores
-    
-    def _calculate_lddt_with_alignment(self, template_residue_coords, target_residue_coords, 
-                                     seqxA: str, seqyA: str, seqM: str):
-        """
-        Calculate LDDT scores for all residues in protein 2 using the alignment information.
-        
-        Args:
-            template_residue_coords: All template residue coordinates
-            target_residue_coords: All target residue coordinates
-            seqxA: Aligned sequence A (template)
-            seqyA: Aligned sequence B (target)
-            seqM: Alignment annotation
-            
-        Returns:
-            Array of LDDT scores for all residues in protein 2 (0 for unaligned, real score for aligned)
-        """
-        # LDDT distance thresholds
-        thresholds = [0.5, 1.0, 2.0, 4.0]
-        
-        # Initialize array for all protein 2 residues with 0 scores
-        lddt_scores = np.zeros(MAX_RESIDUES)
-        
-        # Track residue indices in original sequences
-        template_idx = target_idx = 0
-        
-        for a1, a2, ann in zip(seqxA, seqyA, seqM):
-            if a1 != '-' and a2 != '-':
-                if ann in [':', '.']:  # Only include aligned residues
-                    if template_idx < len(template_residue_coords) and target_idx < len(target_residue_coords):
-                        # Calculate LDDT for this aligned residue pair
-                        lddt_score = self._calculate_residue_lddt(
-                            template_residue_coords, target_residue_coords,
-                            template_idx, target_idx,
-                            thresholds
-                        )
-                        # Assign score to the correct position in protein 2 sequence
-                        lddt_scores[target_idx] = lddt_score
-                
-                template_idx += 1
-                target_idx += 1
-            elif a1 == '-' and a2 != '-':
-                # Gap in template, residue in target (unaligned)
-                # lddt_scores[target_idx] remains 0.0
-                target_idx += 1
-            elif a1 != '-' and a2 == '-':
-                # Residue in template, gap in target
-                template_idx += 1
-        
-        return lddt_scores
-    
-    def _calculate_residue_lddt(self, template_residue_coords, target_residue_coords,
-                               template_res_idx, target_res_idx, thresholds):
-        """
-        Calculate LDDT score for a single aligned residue pair.
-        
-        Proper LDDT algorithm:
-        1. Find all atom pairs within 15Å of the current residue in the template structure
-        2. For each such pair, calculate |distance_in_target - distance_in_template|
-        3. Count how many differences fall within each threshold (0.5, 1, 2, 4Å)
-        4. Final score = 1/4 * (count_0.5 + count_1 + count_2 + count_4) / total_pairs
-        
-        Args:
-            template_residue_coords: All template residue coordinates
-            target_residue_coords: All target residue coordinates
-            template_res_idx: Index of current template residue
-            target_res_idx: Index of current target residue
-            thresholds: Distance thresholds for LDDT
-            
-        Returns:
-            LDDT score for this residue (between 0 and 1)
-        """
-        # Get atoms of the current template residue
-        if template_res_idx >= len(template_residue_coords):
-            return 0.0
-        
-        current_template_atoms = template_residue_coords[template_res_idx]
-        if len(current_template_atoms) == 0:
-            return 0.0
-        
-        # Collect all template atom coordinates with their residue indices
-        template_atom_coords = []
-        template_atom_to_residue = []  # Maps atom index to residue index
-        
-        for res_idx, res_atoms in enumerate(template_residue_coords):
-            for atom_idx, atom_coord in enumerate(res_atoms):
-                template_atom_coords.append(atom_coord)
-                template_atom_to_residue.append(res_idx)
-        
-        if len(template_atom_coords) == 0:
-            return 0.0
-        
-        template_atom_coords = np.array(template_atom_coords)
-        
-        # Find atom pairs within 15Å of the current residue
-        local_atom_pairs = []
-        current_atom_start_idx = sum(len(template_residue_coords[i]) for i in range(template_res_idx))
-        current_atom_end_idx = current_atom_start_idx + len(current_template_atoms)
-        
-        # For each atom in the current residue, find all other atoms within 15Å
-        for i in range(current_atom_start_idx, current_atom_end_idx):
-            for j in range(len(template_atom_coords)):
-                if i != j:  # Don't include self-pairs
-                    dist = np.linalg.norm(template_atom_coords[i] - template_atom_coords[j])
-                    if dist <= 15.0:  # 15Å threshold
-                        local_atom_pairs.append((i, j, dist))
-        
-        if not local_atom_pairs:
-            return 0.0
-        
-        # Collect all target atom coordinates
-        target_atom_coords = []
-        for res_idx, res_atoms in enumerate(target_residue_coords):
-            for atom_idx, atom_coord in enumerate(res_atoms):
-                target_atom_coords.append(atom_coord)
-        
-        if len(target_atom_coords) == 0:
-            return 0.0
-        
-        target_atom_coords = np.array(target_atom_coords)
-        
-        # Calculate distance differences for each local atom pair
-        distance_differences = []
-        for i, j, template_dist in local_atom_pairs:
-            if i < len(target_atom_coords) and j < len(target_atom_coords):
-                # Get corresponding target coordinates
-                target_coord1 = target_atom_coords[i]
-                target_coord2 = target_atom_coords[j]
-                target_dist = np.linalg.norm(target_coord1 - target_coord2)
-                
-                # Calculate absolute difference
-                diff = abs(target_dist - template_dist)
-                distance_differences.append(diff)
-        
-        if not distance_differences:
-            return 0.0
-        
-        # Count differences within each threshold
-        counts = []
-        for threshold in thresholds:
-            count = sum(1 for diff in distance_differences if diff <= threshold)
-            counts.append(count)
-        
-        # Calculate final LDDT score
-        total_pairs = len(distance_differences)
-        if total_pairs == 0:
-            return 0.0
-        
-        # Final score = 1/4 * (sum of normalized counts)
-        lddt_score = sum(count / total_pairs for count in counts) / len(thresholds)
-        
-        return lddt_score
-    
-    def process_protein_pair(self, pdb1_gcs_path: str, pdb2_gcs_path: str, 
-                           seqxA: str, seqyA: str, seqM: str, tm_score: float = None) -> Optional[Dict]:
-        """
-        Process a single protein pair to extract LDDT scores.
-        
-        Args:
-            pdb1_gcs_path: GCS path to first PDB file (template)
-            pdb2_gcs_path: GCS path to second PDB file (target)
-            seqxA: Aligned sequence A
-            seqyA: Aligned sequence B
-            seqM: Alignment annotation
-            tm_score: Optional TM score
-            
-        Returns:
-            Dictionary with LDDT scores, or None if error
-        """
+    def process_protein_pair(self, pdb1_gcs_path: str, pdb2_gcs_path: str) -> Optional[Dict]:
         try:
-            # Get LDDT scores for all residues in protein 2 using provided alignment
-            lddt_scores = self.get_lddt_scores_with_alignment(pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM)
-            
-            # Convert LDDT scores to string format for CSV
-            lddt_scores_str = json.dumps(lddt_scores.tolist())
-            
-            # Extract protein IDs from GCS paths for output
+            # Download PDB files from GCS to local temp files
+            with self.read_pdb_from_gcs(pdb1_gcs_path) as pdb1_file, \
+                 self.read_pdb_from_gcs(pdb2_gcs_path) as pdb2_file:
+                # Pass pdb1_file and pdb2_file directly to your coordinate/sequence extraction
+                model_coords_all, model_seq = self.get_ca_coords_and_seq(pdb2_file)
+                reference_coords_all, reference_seq = self.get_ca_coords_and_seq(pdb1_file)
+
             protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
             protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
-            
-            # Count aligned residues (non-zero scores)
-            aligned_residues = lddt_scores[lddt_scores > 0]
-            num_aligned = len(aligned_residues)
-            
-            # Calculate average LDDT only for aligned residues
-            avg_lddt = float(np.mean(aligned_residues)) if num_aligned > 0 else 0.0
+            print(f"{protein_id1}.pdb ({len(reference_seq)} aa) vs {protein_id2}.pdb ({len(model_seq)} aa)")
+
+            # Run TM-align
+            result = tm_align(reference_coords_all, model_coords_all, reference_seq, model_seq)
+            tm_score = result.tm_norm_chain1
+            seqxA = result.seqxA
+            seqyA = result.seqyA
+            seqM = result.seqM
+
+            # Parse alignment pairs using parse_tm_align_result
+            alignment_pairs = self.parse_tm_align_result(result)
+
+            # Load all Cα coordinates
+            model_coords = np.array([model_coords_all[i] for _, i in alignment_pairs])
+            reference_coords = np.array([reference_coords_all[j] for j, _ in alignment_pairs])
+
+            # Calculate lDDT per-residue scores using self.lddt_calculator
+            per_residue_scores = self.lddt_calculator.calculate_lddt(model_coords, reference_coords)
+
+            # Pad lDDT scores to length 300, placing each score at the correct model index
+            lddt_scores_padded = np.zeros(300, dtype=float)
+            for score_idx, (model_idx, _) in enumerate(alignment_pairs):
+                if model_idx < 300:
+                    lddt_scores_padded[model_idx] = per_residue_scores[score_idx]
+            lddt_scores_str = json.dumps(lddt_scores_padded.tolist())
+
+            # Clean up temp files
+            pdb1_file.close()
+            pdb2_file.close()
+
+            avg_lddt = float(np.mean(per_residue_scores[per_residue_scores > 0])) if np.any(per_residue_scores > 0) else 0.0
             
             return {
                 'protein_id1': protein_id1,
                 'protein_id2': protein_id2,
-                'pdb1_gcs_path': pdb1_gcs_path,
-                'pdb2_gcs_path': pdb2_gcs_path,
-                'lddt_scores_protein2': lddt_scores_str,
                 'seqxA': seqxA,
                 'seqyA': seqyA,
                 'seqM': seqM,
                 'tm_score': tm_score,
-                'num_aligned_residues': num_aligned,
+                'lddt_scores_protein2': lddt_scores_str,
                 'avg_lddt_protein2': avg_lddt
             }
-            
         except Exception as e:
             print(f"Error processing {pdb1_gcs_path} vs {pdb2_gcs_path}: {e}")
             return None
-    
-    def cleanup_temp_files(self):
-        """
-        Clean up temporary PDB files.
-        """
-        # This method is now empty as we're not downloading files
-        pass
-    
-    def __del__(self):
-        """
-        Cleanup on deletion.
-        """
-        self.cleanup_temp_files()
-    
-    def _calculate_distances_gpu(self, coords1: np.ndarray, coords2: np.ndarray) -> np.ndarray:
-        """
-        Calculate pairwise distances between two sets of coordinates using GPU.
-        
-        Args:
-            coords1: First set of coordinates [N, 3]
-            coords2: Second set of coordinates [M, 3]
-            
-        Returns:
-            Distance matrix [N, M]
-        """
-        if not self.use_gpu:
-            # Fallback to CPU calculation
-            return self._calculate_distances_cpu(coords1, coords2)
-        
-        # Convert to PyTorch tensors
-        coords1_tensor = torch.FloatTensor(coords1).to(self.device)
-        coords2_tensor = torch.FloatTensor(coords2).to(self.device)
-        
-        # Calculate distances using broadcasting
-        # ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a·b
-        dist_sq = torch.sum(coords1_tensor**2, dim=1, keepdim=True) + \
-                  torch.sum(coords2_tensor**2, dim=1) - \
-                  2 * torch.mm(coords1_tensor, coords2_tensor.t())
-        
-        # Take square root and return as numpy
-        distances = torch.sqrt(torch.clamp(dist_sq, min=0)).cpu().numpy()
-        return distances
-    
-    def _calculate_distances_cpu(self, coords1: np.ndarray, coords2: np.ndarray) -> np.ndarray:
-        """
-        Calculate pairwise distances between two sets of coordinates using CPU.
-        
-        Args:
-            coords1: First set of coordinates [N, 3]
-            coords2: Second set of coordinates [M, 3]
-            
-        Returns:
-            Distance matrix [N, M]
-        """
-        # Use scipy for efficient distance calculation
-        from scipy.spatial.distance import cdist
-        return cdist(coords1, coords2)
-    
-    def _find_pairs_within_threshold_gpu(self, coords: np.ndarray, threshold: float) -> List[Tuple[int, int, float]]:
-        """
-        Find all atom pairs within a distance threshold using GPU acceleration.
-        
-        Args:
-            coords: Atom coordinates [N, 3]
-            threshold: Distance threshold
-            
-        Returns:
-            List of (i, j, distance) tuples for pairs within threshold
-        """
-        if not self.use_gpu:
-            return self._find_pairs_within_threshold_cpu(coords, threshold)
-        
-        # Convert to PyTorch tensor
-        coords_tensor = torch.FloatTensor(coords).to(self.device)
-        
-        # Calculate all pairwise distances
-        dist_matrix = self._calculate_distances_gpu(coords, coords)
-        
-        # Find pairs within threshold (upper triangle only)
-        pairs = []
-        for i in range(len(coords)):
-            for j in range(i + 1, len(coords)):
-                dist = dist_matrix[i, j]
-                if dist <= threshold:
-                    pairs.append((i, j, dist))
-        
-        return pairs
-    
-    def _find_pairs_within_threshold_cpu(self, coords: np.ndarray, threshold: float) -> List[Tuple[int, int, float]]:
-        """
-        Find all atom pairs within a distance threshold using CPU.
-        
-        Args:
-            coords: Atom coordinates [N, 3]
-            threshold: Distance threshold
-            
-        Returns:
-            List of (i, j, distance) tuples for pairs within threshold
-        """
-        pairs = []
-        for i in range(len(coords)):
-            for j in range(i + 1, len(coords)):
-                dist = np.linalg.norm(coords[i] - coords[j])
-                if dist <= threshold:
-                    pairs.append((i, j, dist))
-        return pairs
-    
-    def _get_cached_structure(self, gcs_path: str):
-        """
-        Get PDB structure from cache or load it.
-        
-        Args:
-            gcs_path: GCS path to PDB file
-            
-        Returns:
-            List of residue coordinates
-        """
-        if gcs_path in self.structure_cache:
-            return self.structure_cache[gcs_path]
-        
-        # Load structure
-        pdb_file = self.read_pdb_from_gcs(gcs_path)
-        structure_coords = self.get_all_atom_coords_from_structure(pdb_file)
-        pdb_file.close()
-        
-        # Cache the result
-        if len(self.structure_cache) >= self.max_cache_size:
-            # Remove oldest entry (simple FIFO)
-            oldest_key = next(iter(self.structure_cache))
-            del self.structure_cache[oldest_key]
-        
-        self.structure_cache[gcs_path] = structure_coords
-        return structure_coords
 
+    def get_ca_coords_and_seq(self, pdb_file):
+        """
+        Extract C-alpha coordinates and sequence from PDB file, using one-letter codes for the sequence.
+        """
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('', pdb_file)
+        
+        three_to_one = {
+            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+        }
+        coords = []
+        seq = []
+        for model in structure:
+            for chain in model:
+                for residue in chain:
+                    if 'CA' in residue:
+                        coords.append(residue['CA'].get_coord())
+                        resname = residue.get_resname()
+                        seq.append(three_to_one.get(resname, 'X'))  # Use 'X' for unknowns
+        coords = np.array(coords)
+        seq = ''.join(seq)
+        return coords, seq
+        
+    def parse_tm_align_result(self, result):
+        """
+        Parse TM-align result to get residue alignment.
+        """
+        aligned_seq1 = result.seqxA
+        aligned_seq2 = result.seqyA
+        annotation = result.seqM
+        alignment = []
+        idx1 = idx2 = 0
+        for a1, a2, ann in zip(aligned_seq1, aligned_seq2, annotation):
+            if a1 != '-' and a2 != '-':
+                if ann in [':', '.']:
+                    alignment.append((idx1, idx2))
+                idx1 += 1
+                idx2 += 1
+            elif a1 == '-' and a2 != '-':
+                idx2 += 1
+            elif a1 != '-' and a2 == '-':
+                idx1 += 1
+        return alignment
 
 def load_protein_pairs_with_alignments_batch(csv_file, pdb_folder: str, batch_size: int = 1000) -> List[Tuple[str, str, str, str, str, float]]:
     """
@@ -511,38 +236,6 @@ def load_protein_pairs_with_alignments_batch(csv_file, pdb_folder: str, batch_si
         yield protein_pairs
 
 
-def save_results(results: List[Dict], output_path: str):
-    """
-    Save results to CSV file.
-    
-    Args:
-        results: List of result dictionaries
-        output_path: Path to output CSV file
-    """
-    if not results:
-        print("No results to save!")
-        return
-    
-    # Define CSV columns (removed PDB paths)
-    fieldnames = [
-        'protein_id1', 'protein_id2', 
-        'lddt_scores_protein2', 'seqxA', 'seqyA', 'seqM',
-        'tm_score', 'num_aligned_residues', 'avg_lddt_protein2'
-    ]
-    
-    with open(output_path, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        
-        for result in results:
-            # Create a copy without PDB paths
-            clean_result = {k: v for k, v in result.items() if k in fieldnames}
-            writer.writerow(clean_result)
-    
-    print(f"Results saved to: {output_path}")
-    print(f"Processed {len(results)} protein pairs successfully")
-
-
 def _process_single_pair_standalone(protein_pair: Tuple, bucket_name: str, use_gpu: bool = True) -> Optional[Dict]:
     """
     Process a single protein pair (standalone function for multiprocessing).
@@ -560,12 +253,12 @@ def _process_single_pair_standalone(protein_pair: Tuple, bucket_name: str, use_g
     try:
         # Create a temporary extractor for this single pair
         temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
-        return temp_extractor.process_protein_pair(pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM, tm_score)
+        return temp_extractor.process_protein_pair(pdb1_gcs_path, pdb2_gcs_path)
     except Exception as e:
         print(f"Error processing {pdb1_gcs_path} vs {pdb2_gcs_path}: {e}")
         return None
 
-def process_protein_pairs_parallel_standalone(protein_pairs: List[Tuple], bucket_name: str, 
+def process_protein_pairs_parallel_standalone(protein_pairs: List[Tuple], bucket_name: str,
                                             num_processes: int = None, use_gpu: bool = True) -> List[Dict]:
     """
     Process protein pairs in parallel using multiprocessing (standalone version).
@@ -616,7 +309,6 @@ def main():
     input_csv = "SWISS_MODEL/tm_score_comparison_results.csv"  # Input CSV file with protein pairs and alignments
     bucket_name = "jx-compbio"  # GCS bucket name
     pdb_folder = "SWISS_MODEL/pdbs"  # GCS folder containing PDB files
-    output_csv = "results.csv"  # Output CSV file for results
     max_pairs = 10  # Maximum number of pairs to process from CSV (None for all)
     batch_size = 1000  # Number of pairs to process in each batch
     use_gpu = True  # Whether to use GPU acceleration
@@ -664,12 +356,6 @@ def main():
         
         processed_count += len(protein_pairs_batch)
         
-        # Save intermediate results after each batch
-        temp_output = output_csv.replace('.csv', f'_temp_batch_{batch_idx + 1}.csv')
-        save_results(results, temp_output)
-        print(f"Batch {batch_idx + 1} completed. Intermediate results saved: {temp_output}")
-        print(f"Processed so far: {processed_count} pairs, Successful: {len(results)}")
-        
         # Check if we've reached max_pairs limit
         if max_pairs and processed_count >= max_pairs:
             break
@@ -677,16 +363,23 @@ def main():
     # Close CSV file
     csv_file.close()
     
-    # Save final results
-    save_results(results, output_csv)
-    
     # Report statistics
     print(f"\nProcessing completed!")
     print(f"Total pairs processed: {processed_count}")
     print(f"Successful pairs: {len(results)}")
     print(f"Failed pairs: {processed_count - len(results)}")
     
-    print(f"\nResults saved to: {output_csv}")
+    # Save results to CSV
+    if results:
+        df = pd.DataFrame(results)
+        output_file = 'lddt_results.csv'
+        df.to_csv(output_file, index=False)
+        print(f"\nResults saved to: {output_file}")
+        print(f"Columns: {list(df.columns)}")
+    else:
+        print("\nNo results to save.")
+    
+    print(f"\nResults saved to: {input_csv}")
     print("UPDATED: This version uses parallel processing and GPU acceleration!")
     
     # Colab-specific download instructions
