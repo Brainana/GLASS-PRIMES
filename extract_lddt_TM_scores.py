@@ -27,10 +27,16 @@ from tmtools import tm_align
 from lddt import LDDTCalculator
 from google.cloud import bigquery
 import time
+import base64
 
-# Set this to the line number (0-based) to start processing from
-START_LINE = 150  
-client = bigquery.Client(project="mit-primes-464001")
+START_LINE = 200  # Line to start from
+max_pairs = 1000  # Maximum number of pairs to process from CSV (None for all)
+client = bigquery.Client(project="mit-primes-464001") # BigQuery client
+bucket_name = "jx-compbio"  # GCS bucket name
+batch_size = 1000  # Number of pairs to process in each batch
+use_gpu = True  # Whether to use GPU acceleration
+num_processes = None  # Number of processes for parallel processing (None = auto)
+
 
 # Try to import PyTorch for GPU acceleration
 try:
@@ -40,6 +46,21 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+PDB_INFO_TABLE = "mit-primes-464001.primes_data.pdb_info"
+
+# Helper to fetch PDB info from BigQuery
+def fetch_pdb_info_batch(protein_ids, bq_client=None, table_id=PDB_INFO_TABLE):
+    # Use IN clause for better performance
+    query = f"SELECT id, coords, seq FROM `{table_id}` WHERE id IN UNNEST({protein_ids})"
+    result = bq_client.query(query)
+    coords_seq = {}
+    for row in result:
+        # row["coords"] is returned as bytes by BigQuery client for BYTES columns
+        coords_bytes = row["coords"]
+        seq = row["seq"]
+        coords = np.frombuffer(coords_bytes, dtype=np.float32).reshape(-1, 3)
+        coords_seq[row["id"]] = (coords, seq)
+    return coords_seq
 
 class LDDTExtractor:
     """
@@ -90,20 +111,17 @@ class LDDTExtractor:
         # Get blob and return as file-like object
         blob = self.bucket.blob(gcs_path)
         return blob.open('r')
-    
-    def score_protein_pair(self, pdb1_gcs_path: str, pdb2_gcs_path: str) -> Optional[Dict]:
+
+
+    def score_protein_pair(self, protein_id1: str, protein_id2: str, pdb_info_dict=None) -> Optional[Dict]:
         try:
-            # Download PDB files from GCS to local temp files
-            with self.read_from_gcs(pdb1_gcs_path) as pdb1_file, \
-                 self.read_from_gcs(pdb2_gcs_path) as pdb2_file:
-                # Pass pdb1_file and pdb2_file directly to your coordinate/sequence extraction
-                model_coords_all, model_seq = self.get_ca_coords_and_seq(pdb2_file)
-                reference_coords_all, reference_seq = self.get_ca_coords_and_seq(pdb1_file)
-            
-            pdb1_file.close()
-            pdb2_file.close()
-            protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
-            protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
+            # Fetch CA coords and seq from provided dict (batch-fetched)
+            if pdb_info_dict is not None:
+                reference_coords_all, reference_seq = pdb_info_dict[protein_id1]
+                model_coords_all, model_seq = pdb_info_dict[protein_id2]
+            else:
+                reference_coords_all, reference_seq = fetch_pdb_info(protein_id1)
+                model_coords_all, model_seq = fetch_pdb_info(protein_id2)
 
             # Run TM-align
             result = tm_align(reference_coords_all, model_coords_all, reference_seq, model_seq)
@@ -138,36 +156,9 @@ class LDDTExtractor:
                 'lddt_scores': lddt_scores_padded.tolist()
             }
         except Exception as e:
-            print(f"Error processing {pdb1_gcs_path} vs {pdb2_gcs_path}: {e}")
+            print(f"Error processing {protein_id1} vs {protein_id2}: {e}")
             return None
 
-    def get_ca_coords_and_seq(self, pdb_file):
-        """
-        Extract C-alpha coordinates and sequence from PDB file, using one-letter codes for the sequence.
-        """
-        parser = PDBParser(QUIET=True)
-        structure = parser.get_structure('', pdb_file)
-        
-        three_to_one = {
-            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
-            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
-            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
-            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
-        }
-        coords = []
-        seq = []
-        for model in structure:
-            for chain in model:
-                for residue in chain:
-                    if 'CA' in residue:
-                        coords.append(residue['CA'].get_coord())
-                        resname = residue.get_resname()
-                        seq.append(three_to_one.get(resname, 'X'))  # Use 'X' for unknowns
-                break
-        coords = np.array(coords)
-        seq = ''.join(seq)
-        return coords, seq
-        
     def parse_tm_align_result(self, result):
         """
         Parse TM-align result to get residue alignment.
@@ -242,36 +233,22 @@ def batch_check_existing_pairs(client, table_id, pairs):
     """
     if not pairs:
         return set()
-    # Build a series of OR conditions
-    conditions = " OR ".join([f"(id1 = '{id1}' AND id2 = '{id2}')" for id1, id2 in pairs])
+    # Use tuple IN clause for better performance
     query = f"""
         SELECT id1, id2 FROM {table_id}
-        WHERE {conditions}
+        WHERE (id1, id2) IN UNNEST({pairs})
     """
     results = client.query(query).result()
     return {(row.id1, row.id2) for row in results}
 
-def process_pair(args):
-    """
-    Simplified process_pair function that only takes protein paths and runs TM-align fresh.
-    """
-    table_id, bucket_name, use_gpu, protein_pair = args
-    # Unpack protein pair
-    pdb1_gcs_path, pdb2_gcs_path = protein_pair
-    protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
-    protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
+def process_pair_ids(args):
+    protein_id1, protein_id2, pdb_info_dict = args
     start_time = time.time()
-    try:
-        temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
-        # Run TM-align fresh (no pre-computed alignments)
-        result = temp_extractor.score_protein_pair(pdb1_gcs_path, pdb2_gcs_path)
-        elapsed = time.time() - start_time
-        print(f"Processed {protein_id1}, {protein_id2} [Time: {elapsed:.2f}s]")
-        return result
-    except Exception as e:
-        elapsed = time.time() - start_time
-        print(f"Error processing {protein_id1}, {protein_id2}: {e} [Time: {elapsed:.2f}s]")
-        return None
+    temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
+    ret = temp_extractor.score_protein_pair(protein_id1, protein_id2, pdb_info_dict=pdb_info_dict)
+    elapsed_time = time.time() - start_time
+    print(f"{protein_id1} {protein_id2}: {elapsed_time:.2f}")
+    return ret
 
 def main():
     """
@@ -280,13 +257,8 @@ def main():
     """
     # Configuration - modify these variables as needed
     input_csv = "SWISS_MODEL/tm_score_comparison_results.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
-    bucket_name = "jx-compbio"  # GCS bucket name
     pdb_folder = "SWISS_MODEL/pdbs"  # GCS folder containing PDB files 
     table_id = "mit-primes-464001.primes_data.ground_truth_scores" # BigQuery table id
-    max_pairs = 10  # Maximum number of pairs to process from CSV (None for all)
-    batch_size = 32  # Number of pairs to process in each batch
-    use_gpu = True  # Whether to use GPU acceleration
-    num_processes = None  # Number of processes for parallel processing (None = auto)
 
     # Initialize extractor with GPU support
     extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
@@ -309,7 +281,8 @@ def main():
     for batch_idx, (protein_pairs_batch, batch_start_line) in enumerate(load_protein_pairs_simple_batch(csv_file, pdb_folder, batch_size, start_line=START_LINE, max_pairs=max_pairs)):
         print(f"Processing batch {batch_idx + 1} ({len(protein_pairs_batch)} pairs)... (starting at line {batch_start_line})")
         last_line_processed = batch_start_line + len(protein_pairs_batch) - 1
-
+        batch_start_time = time.time()
+        start_time = time.time()
         # Extract just the IDs for batch existence check
         id_pairs = [
             (os.path.splitext(os.path.basename(p1))[0], os.path.splitext(os.path.basename(p2))[0])
@@ -321,19 +294,31 @@ def main():
             pair for pair, id_pair in zip(protein_pairs_batch, id_pairs)
             if id_pair not in existing_pairs
         ]
+        filtered_id_pairs = [id_pair for pair, id_pair in zip(protein_pairs_batch, id_pairs) if id_pair not in existing_pairs]
+        elapsed_time = time.time()-start_time
+        print(f"id existence: {elapsed_time:.2f}s")
         if not filtered_pairs:
             print("All pairs in this batch already exist in BigQuery, skipping batch.")
             continue
 
-        # Prepare arguments for each pair (simplified - just protein paths)
+        start_time = time.time()
+        # Batch fetch all unique protein IDs for this batch
+        unique_ids = set()
+        for id1, id2 in filtered_id_pairs:
+            unique_ids.add(id1)
+            unique_ids.add(id2)
+        pdb_info_dict = fetch_pdb_info_batch(list(unique_ids), bq_client=client)
+
+        # Prepare arguments for each pair (now just the id pairs)
         pool_args = [
-            (table_id, bucket_name, use_gpu, protein_pair)
-            for protein_pair in filtered_pairs
+            (id1, id2, pdb_info_dict)
+            for id1, id2 in filtered_id_pairs
         ]
+        elapsed_time = time.time()-start_time
+        print(f"pdbs: {elapsed_time:.2f}s")
         # Multiprocess: only process new pairs
-        batch_start_time = time.time()
         with torch_mp.Pool(processes=num_processes or min(mp.cpu_count(), len(pool_args))) as pool:
-            batch_results = pool.map(process_pair, pool_args)
+            batch_results = pool.map(process_pair_ids, pool_args)
         batch_elapsed = time.time() - batch_start_time
         # Filter out None results (skipped or failed)
         batch_results = [r for r in batch_results if r is not None]
