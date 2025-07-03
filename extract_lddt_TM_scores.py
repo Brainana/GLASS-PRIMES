@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
-"""
-Extract LDDT scores for protein pairs using provided alignments.
-Downloads PDB files from GCS and computes structural comparisons.
-UPDATED: Accepts seqxA, seqyA, and seqM as alignment inputs.
-UPDATED: Accepts GCS file paths directly instead of protein IDs.
-COLAB VERSION: Includes setup for Google Colab environment.
-CORRECTED: Implements proper LDDT algorithm with 15Å cutoff and distance difference thresholds.
-"""
 
 # Google Cloud authentication for Colab
 try:
     from google.colab import auth
     auth.authenticate_user()
-    print("✓ Google Cloud authentication completed")
 except ImportError:
     print("Not running in Colab - skipping authentication")
     print("Make sure you have proper GCS credentials set up")
 
+import multiprocessing as mp
 import pandas as pd
 import numpy as np
 import os
 import json
+import pickle
+import hashlib
+import tempfile
+import fcntl
 from typing import List, Dict, Tuple, Optional
 from google.cloud import storage
 from Bio.PDB import PDBParser
 from tqdm import tqdm
 import csv
-import multiprocessing as mp
 from functools import partial
 from tmtools import tm_align
 from lddt import LDDTCalculator
+from google.cloud import bigquery
+import time
 
-MAX_PAIRS = 10  # Set to an integer to limit, or None to process all pairs
+# Set this to the line number (0-based) to start processing from
+START_LINE = 0  
+client = bigquery.Client(project="mit-primes-464001")
 
 # Try to import PyTorch for GPU acceleration
 try:
     import torch
     TORCH_AVAILABLE = True
-    print("✓ PyTorch available for GPU acceleration")
+    import torch.multiprocessing as torch_mp
 except ImportError:
     TORCH_AVAILABLE = False
-    print("⚠ PyTorch not available - using CPU only")
 
 
 class LDDTExtractor:
@@ -69,16 +67,13 @@ class LDDTExtractor:
         # Initialize GPU device if available
         if self.use_gpu:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            print(f"✓ Using GPU acceleration: {self.device}")
         else:
             self.device = None
-            print("Using CPU only")
         
         # Cache for PDB structures to avoid re-reading
         self.structure_cache = {}
         self.max_cache_size = 100  # Limit cache size to prevent memory issues
         
-        print(f"Initialized LDDT extractor (UPDATED) for bucket: {bucket_name}")
         # Initialize lDDT calculator
         self.lddt_calculator = LDDTCalculator()
     
@@ -107,7 +102,6 @@ class LDDTExtractor:
 
             protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
             protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
-            print(f"{protein_id1}.pdb ({len(reference_seq)} aa) vs {protein_id2}.pdb ({len(model_seq)} aa)")
 
             # Run TM-align
             result = tm_align(reference_coords_all, model_coords_all, reference_seq, model_seq)
@@ -131,23 +125,19 @@ class LDDTExtractor:
             for score_idx, (model_idx, _) in enumerate(alignment_pairs):
                 if model_idx < 300:
                     lddt_scores_padded[model_idx] = per_residue_scores[score_idx]
-            lddt_scores_str = json.dumps(lddt_scores_padded.tolist())
-
+            
             # Clean up temp files
             pdb1_file.close()
             pdb2_file.close()
-
-            avg_lddt = float(np.mean(per_residue_scores[per_residue_scores > 0])) if np.any(per_residue_scores > 0) else 0.0
             
             return {
-                'protein_id1': protein_id1,
-                'protein_id2': protein_id2,
-                'seqxA': seqxA,
-                'seqyA': seqyA,
-                'seqM': seqM,
+                'id1': protein_id1,
+                'id2': protein_id2,
                 'tm_score': tm_score,
-                'lddt_scores_protein2': lddt_scores_str,
-                'avg_lddt_protein2': avg_lddt
+                'seqxA': seqxA,
+                'seqM': seqM,
+                'seqyA': seqyA,
+                'lddt_scores': lddt_scores_padded.tolist()
             }
         except Exception as e:
             print(f"Error processing {pdb1_gcs_path} vs {pdb2_gcs_path}: {e}")
@@ -175,6 +165,7 @@ class LDDTExtractor:
                         coords.append(residue['CA'].get_coord())
                         resname = residue.get_resname()
                         seq.append(three_to_one.get(resname, 'X'))  # Use 'X' for unknowns
+                break
         coords = np.array(coords)
         seq = ''.join(seq)
         return coords, seq
@@ -200,131 +191,102 @@ class LDDTExtractor:
                 idx1 += 1
         return alignment
 
-def load_protein_pairs_with_alignments_batch(csv_file, pdb_folder: str, batch_size: int = 1000) -> List[Tuple[str, str, str, str, str, float]]:
+def load_protein_pairs_simple_batch(csv_file, pdb_folder: str, batch_size: int = 32, start_line: int = 0, max_pairs: int = None) -> List[Tuple[str, str]]:
     """
-    Load protein pairs with alignments from CSV file in batches.
+    Load protein pairs from CSV file in batches, extracting only protein IDs.
+    This version doesn't load pre-computed alignments - TM-align will be run fresh.
     
     Args:
-        csv_file: File-like object for CSV file with protein pairs and alignments
+        csv_file: File-like object for CSV file with protein pairs
         pdb_folder: GCS folder containing PDB files
         batch_size: Number of rows to process at once
-        
+        start_line: Line number (0-based) to start processing from
+        max_pairs: Maximum number of pairs to process (None for all)
     Yields:
-        List of (pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM, tm_score) tuples
+        List of (pdb1_gcs_path, pdb2_gcs_path) tuples
     """
-    
-    # Read CSV in chunks
-    chunk_iter = pd.read_csv(csv_file, chunksize=batch_size)
+    # Read CSV in chunks, skipping lines before start_line
+    chunk_iter = pd.read_csv(csv_file, chunksize=batch_size, skiprows=range(1, start_line+1))
+    current_line = start_line
+    pairs_processed = 0
     
     for chunk in chunk_iter:
-        # Extract columns from this chunk
         protein_pairs = []
         for _, row in chunk.iterrows():
+            # Check if we've reached max_pairs limit
+            if max_pairs and pairs_processed >= max_pairs:
+                break
+                
             protein_id1 = str(row['chain_1']).strip()
             protein_id2 = str(row['chain_2']).strip()
-            seqxA = str(row['seqxA']).strip()
-            seqyA = str(row['seqyA']).strip()
-            seqM = str(row['seqM']).strip()
-            tm_score = float(row.get('computed_tm', 0.0)) if 'computed_tm' in row else None
-            
-            # Construct full GCS paths
             pdb1_gcs_path = f"{pdb_folder}/{protein_id1}.pdb"
             pdb2_gcs_path = f"{pdb_folder}/{protein_id2}.pdb"
-            
-            protein_pairs.append((pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM, tm_score))
+            protein_pairs.append((pdb1_gcs_path, pdb2_gcs_path))
+            pairs_processed += 1
         
-        yield protein_pairs
+        if protein_pairs:  # Only yield if we have pairs
+            yield protein_pairs, current_line
+            current_line += len(protein_pairs)
+        
+        # Break if we've reached max_pairs
+        if max_pairs and pairs_processed >= max_pairs:
+            break
 
 
-def _process_single_pair_standalone(protein_pair: Tuple, bucket_name: str, use_gpu: bool = True) -> Optional[Dict]:
+def process_pair_simple(args):
     """
-    Process a single protein pair (standalone function for multiprocessing).
-    
-    Args:
-        protein_pair: (pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM, tm_score) tuple
-        bucket_name: GCS bucket name
-        use_gpu: Whether to use GPU acceleration
-        
-    Returns:
-        Result dictionary or None if failed
+    Simplified process_pair function that only takes protein paths and runs TM-align fresh.
     """
-    pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM, tm_score = protein_pair
+    table_id, bucket_name, use_gpu, protein_pair = args
     
-    try:
-        # Create a temporary extractor for this single pair
-        temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
-        return temp_extractor.process_protein_pair(pdb1_gcs_path, pdb2_gcs_path)
-    except Exception as e:
-        print(f"Error processing {pdb1_gcs_path} vs {pdb2_gcs_path}: {e}")
+    # Unpack protein pair
+    pdb1_gcs_path, pdb2_gcs_path = protein_pair
+    protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
+    protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
+    start_time = time.time()
+    
+    # Check if pair exists
+    query = f"""
+        SELECT id1 FROM {table_id}
+        WHERE id1 = '{protein_id1}' AND id2 = '{protein_id2}'
+    """
+    results = client.query(query).result()
+    row = next(results, None)
+    if row is not None:
+        elapsed = time.time() - start_time
+        print(f"Skipping {protein_id1}, {protein_id2} (already in table) [Time: {elapsed:.2f}s]")
         return None
-
-def process_protein_pairs_parallel_standalone(protein_pairs: List[Tuple], bucket_name: str,
-                                            num_processes: int = None, use_gpu: bool = True) -> List[Dict]:
-    """
-    Process protein pairs in parallel using multiprocessing (standalone version).
     
-    Args:
-        protein_pairs: List of (pdb1_gcs_path, pdb2_gcs_path, seqxA, seqyA, seqM, tm_score) tuples
-        bucket_name: GCS bucket name
-        num_processes: Number of processes to use (default: CPU count)
-        use_gpu: Whether to use GPU acceleration
-        
-    Returns:
-        List of result dictionaries
-    """
-    if num_processes is None:
-        num_processes = min(mp.cpu_count(), len(protein_pairs))
-    
-    print(f"Processing {len(protein_pairs)} protein pairs using {num_processes} processes...")
-    
-    # Create a partial function with the bucket name and GPU setting
-    process_func = partial(_process_single_pair_standalone, bucket_name=bucket_name, use_gpu=use_gpu)
-    
-    # Process in parallel
-    with mp.Pool(processes=num_processes) as pool:
-        results = list(tqdm(
-            pool.imap(process_func, protein_pairs),
-            total=len(protein_pairs),
-            desc="Processing protein pairs"
-        ))
-    
-    # Filter out None results (failed pairs)
-    valid_results = [r for r in results if r is not None]
-    failed_count = len(results) - len(valid_results)
-    
-    print(f"Completed: {len(valid_results)} successful, {failed_count} failed")
-    return valid_results
-
+    # If not exists, process the pair
+    try:
+        temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
+        # Run TM-align fresh (no pre-computed alignments)
+        result = temp_extractor.process_protein_pair(pdb1_gcs_path, pdb2_gcs_path)
+        elapsed = time.time() - start_time
+        print(f"Processed {protein_id1}, {protein_id2} [Time: {elapsed:.2f}s]")
+        return result
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"Error processing {protein_id1}, {protein_id2}: {e} [Time: {elapsed:.2f}s]")
+        return None
 
 def main():
     """
-    Main function to extract LDDT scores using provided alignments.
-    
-    COLAB USAGE:
-    1. Make sure your CSV file is in the same GCS bucket as your PDB files
-    2. Modify the configuration variables below
-    3. Run this script
+    Main function to extract LDDT scores using fresh TM-align computations.
+    CSV file should contain at least 'chain_1' and 'chain_2' columns with protein IDs.
     """
     # Configuration - modify these variables as needed
-    input_csv = "SWISS_MODEL/tm_score_comparison_results.csv"  # Input CSV file with protein pairs and alignments
+    input_csv = "SWISS_MODEL/tm_score_comparison_results.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
     bucket_name = "jx-compbio"  # GCS bucket name
     pdb_folder = "SWISS_MODEL/pdbs"  # GCS folder containing PDB files
-    max_pairs = 10  # Maximum number of pairs to process from CSV (None for all)
-    batch_size = 1000  # Number of pairs to process in each batch
+    max_pairs = 100  # Maximum number of pairs to process from CSV (None for all)
+    batch_size = 32  # Number of pairs to process in each batch
     use_gpu = True  # Whether to use GPU acceleration
     num_processes = None  # Number of processes for parallel processing (None = auto)
-    
-    # Colab-specific file handling
-    try:
-        from google.colab import files
-        print("Running in Colab - files will be saved to Colab environment")
-        print("Use files.download() to download results after processing")
-    except ImportError:
-        print("Not running in Colab - files will be saved to local filesystem")
-    
+
     # Initialize extractor with GPU support
     extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
-    
+
     # Read CSV file directly from GCS
     print(f"Reading CSV file from GCS: {input_csv}")
     try:
@@ -334,64 +296,64 @@ def main():
         print(f"Error reading CSV file: {e}")
         print(f"Make sure the file '{input_csv}' exists in bucket '{bucket_name}'")
         return
-    
-    # Process protein pairs in batches
-    results = []
-    failed_pairs = []
-    processed_count = 0
-    
+
+    # BigQuery setup
+    table_id = "mit-primes-464001.primes_data.ground_truth_scores"  # <-- Set your table here
+    try:
+        client.get_table(table_id)
+        print(f"Table {table_id} exists.")
+    except NotFound:
+        print(f"ERROR: Table {table_id} does not exist.")
+
     print(f"Processing protein pairs in batches of {batch_size}...")
-    
+
     # Process batches
-    for batch_idx, protein_pairs_batch in enumerate(load_protein_pairs_with_alignments_batch(csv_file, pdb_folder, batch_size)):
-        print(f"Processing batch {batch_idx + 1} ({len(protein_pairs_batch)} pairs)...")
-        
-        # Limit batch size if max_pairs is set
-        if max_pairs and processed_count + len(protein_pairs_batch) > max_pairs:
-            protein_pairs_batch = protein_pairs_batch[:max_pairs - processed_count]
-        
-        # Process batch in parallel
-        batch_results = process_protein_pairs_parallel_standalone(protein_pairs_batch, bucket_name, num_processes, use_gpu)
-        results.extend(batch_results)
-        
+    processed_count = 0
+    successful_count = 0
+    failed_count = 0
+    last_line_processed = START_LINE + processed_count - 1
+    for batch_idx, (protein_pairs_batch, batch_start_line) in enumerate(load_protein_pairs_simple_batch(csv_file, pdb_folder, batch_size, start_line=START_LINE, max_pairs=max_pairs)):
+        print(f"Processing batch {batch_idx + 1} ({len(protein_pairs_batch)} pairs)... (starting at line {batch_start_line})")
+        last_line_processed = batch_start_line + len(protein_pairs_batch) - 1
+
+        # Prepare arguments for each pair (simplified - just protein paths)
+        pool_args = [
+            (table_id, bucket_name, use_gpu, protein_pair)
+            for protein_pair in protein_pairs_batch
+        ]
+        # Multiprocess: check pair_exists and process if not exists
+        batch_start_time = time.time()
+        with torch_mp.Pool(processes=num_processes or min(mp.cpu_count(), len(pool_args))) as pool:
+            batch_results = pool.map(process_pair_simple, pool_args)
+        batch_elapsed = time.time() - batch_start_time
+        # Filter out None results (skipped or failed)
+        batch_results = [r for r in batch_results if r is not None]
         processed_count += len(protein_pairs_batch)
-        
+        successful_count += len(batch_results)
+        failed_count += len(protein_pairs_batch) - len(batch_results)
+
+        # Insert batch directly into BigQuery
+        if batch_results:
+            errors = client.insert_rows_json(table_id, batch_results)
+            if errors:
+                print(f"Encountered errors while inserting rows: {errors}")
+            else:
+                print(f"Batch {batch_idx + 1} inserted into BigQuery table {table_id}")
+        print(f"Progress: {processed_count} pairs processed | {successful_count} successful | {failed_count} failed | Batch time: {batch_elapsed:.2f}s")
+
         # Check if we've reached max_pairs limit
         if max_pairs and processed_count >= max_pairs:
             break
-    
+
     # Close CSV file
     csv_file.close()
-    
-    # Report statistics
+
     print(f"\nProcessing completed!")
     print(f"Total pairs processed: {processed_count}")
-    print(f"Successful pairs: {len(results)}")
-    print(f"Failed pairs: {processed_count - len(results)}")
-    
-    # Save results to CSV
-    if results:
-        df = pd.DataFrame(results)
-        output_file = 'lddt_results.csv'
-        df.to_csv(output_file, index=False)
-        print(f"\nResults saved to: {output_file}")
-        print(f"Columns: {list(df.columns)}")
-    else:
-        print("\nNo results to save.")
-    
-    print(f"\nResults saved to: {input_csv}")
-    print("UPDATED: This version uses parallel processing and GPU acceleration!")
-    
-    # Colab-specific download instructions
-    try:
-        from google.colab import files
-        print("\nTo download results from Colab, run:")
-        print("files.download('results.csv')")
-        print("Or for intermediate results:")
-        print("files.download('results_temp_batch_1.csv')")
-    except ImportError:
-        print("\nResults saved to local filesystem")
+    print(f"(Batches inserted into BigQuery as processed)")
+    print(f"Last line processed in CSV: {last_line_processed}")
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     main() 
