@@ -48,10 +48,14 @@ except ImportError:
 
 PDB_INFO_TABLE = "mit-primes-464001.primes_data.pdb_info"
 
+# Global GCS client and bucket
+storage_client = storage.Client()
+bucket = storage_client.bucket(bucket_name)
+
 # Helper to fetch PDB info from BigQuery
 def fetch_pdb_info_batch(protein_ids, bq_client=None, table_id=PDB_INFO_TABLE):
     # Use IN clause for better performance
-    query = f"SELECT id, coords, seq FROM `{table_id}` WHERE id IN UNNEST({protein_ids})"
+    query = f"SELECT id, coords, seq FROM `{table_id}` WHERE id IN ({protein_ids})"
     result = bq_client.query(query)
     coords_seq = {}
     for row in result:
@@ -81,10 +85,6 @@ class LDDTExtractor:
         self.bucket_name = bucket_name
         self.use_gpu = use_gpu and TORCH_AVAILABLE
         
-        # Initialize GCS client
-        self.storage_client = storage.Client()
-        self.bucket = self.storage_client.bucket(bucket_name)
-        
         # Initialize GPU device if available
         if self.use_gpu:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -109,7 +109,7 @@ class LDDTExtractor:
             File-like object for reading the PDB file
         """
         # Get blob and return as file-like object
-        blob = self.bucket.blob(gcs_path)
+        blob = bucket.blob(gcs_path)
         return blob.open('r')
 
 
@@ -243,6 +243,14 @@ def batch_check_existing_pairs(client, table_id, pairs):
 
 def process_pair_ids(args):
     protein_id1, protein_id2, pdb_info_dict = args
+    # Check if both PDBs exist in GCS before processing
+    pdb1_path = f"SWISS_MODEL/pdbs/{protein_id1}.pdb"
+    pdb2_path = f"SWISS_MODEL/pdbs/{protein_id2}.pdb"
+    blob1 = bucket.blob(pdb1_path)
+    blob2 = bucket.blob(pdb2_path)
+    if not blob1.exists() or not blob2.exists():
+        print(f"Skipping pair {protein_id1}, {protein_id2}: one or both PDB files do not exist in GCS.")
+        return None
     start_time = time.time()
     temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
     ret = temp_extractor.score_protein_pair(protein_id1, protein_id2, pdb_info_dict=pdb_info_dict)
