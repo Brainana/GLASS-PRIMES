@@ -29,7 +29,7 @@ from google.cloud import bigquery
 import time
 
 # Set this to the line number (0-based) to start processing from
-START_LINE = 0  
+START_LINE = 150  
 client = bigquery.Client(project="mit-primes-464001")
 
 # Try to import PyTorch for GPU acceleration
@@ -77,7 +77,7 @@ class LDDTExtractor:
         # Initialize lDDT calculator
         self.lddt_calculator = LDDTCalculator()
     
-    def read_pdb_from_gcs(self, gcs_path: str) -> str:
+    def read_from_gcs(self, gcs_path: str) -> str:
         """
         Read PDB file directly from GCS without downloading.
         
@@ -91,15 +91,17 @@ class LDDTExtractor:
         blob = self.bucket.blob(gcs_path)
         return blob.open('r')
     
-    def process_protein_pair(self, pdb1_gcs_path: str, pdb2_gcs_path: str) -> Optional[Dict]:
+    def score_protein_pair(self, pdb1_gcs_path: str, pdb2_gcs_path: str) -> Optional[Dict]:
         try:
             # Download PDB files from GCS to local temp files
-            with self.read_pdb_from_gcs(pdb1_gcs_path) as pdb1_file, \
-                 self.read_pdb_from_gcs(pdb2_gcs_path) as pdb2_file:
+            with self.read_from_gcs(pdb1_gcs_path) as pdb1_file, \
+                 self.read_from_gcs(pdb2_gcs_path) as pdb2_file:
                 # Pass pdb1_file and pdb2_file directly to your coordinate/sequence extraction
                 model_coords_all, model_seq = self.get_ca_coords_and_seq(pdb2_file)
                 reference_coords_all, reference_seq = self.get_ca_coords_and_seq(pdb1_file)
-
+            
+            pdb1_file.close()
+            pdb2_file.close()
             protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
             protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
 
@@ -125,10 +127,6 @@ class LDDTExtractor:
             for score_idx, (model_idx, _) in enumerate(alignment_pairs):
                 if model_idx < 300:
                     lddt_scores_padded[model_idx] = per_residue_scores[score_idx]
-            
-            # Clean up temp files
-            pdb1_file.close()
-            pdb2_file.close()
             
             return {
                 'id1': protein_id1,
@@ -174,12 +172,9 @@ class LDDTExtractor:
         """
         Parse TM-align result to get residue alignment.
         """
-        aligned_seq1 = result.seqxA
-        aligned_seq2 = result.seqyA
-        annotation = result.seqM
         alignment = []
         idx1 = idx2 = 0
-        for a1, a2, ann in zip(aligned_seq1, aligned_seq2, annotation):
+        for a1, a2, ann in zip(result.seqxA, result.seqyA, result.seqM):
             if a1 != '-' and a2 != '-':
                 if ann in [':', '.']:
                     alignment.append((idx1, idx2))
@@ -206,7 +201,10 @@ def load_protein_pairs_simple_batch(csv_file, pdb_folder: str, batch_size: int =
         List of (pdb1_gcs_path, pdb2_gcs_path) tuples
     """
     # Read CSV in chunks, skipping lines before start_line
+    start_time = time.time()
     chunk_iter = pd.read_csv(csv_file, chunksize=batch_size, skiprows=range(1, start_line+1))
+    elapsed_time = time.time() - start_time
+    print(f"Reading csv: {elapsed_time:.2f}s")
     current_line = start_line
     pairs_processed = 0
     
@@ -232,36 +230,41 @@ def load_protein_pairs_simple_batch(csv_file, pdb_folder: str, batch_size: int =
         if max_pairs and pairs_processed >= max_pairs:
             break
 
+def batch_check_existing_pairs(client, table_id, pairs):
+    """
+    Check which pairs already exist in BigQuery using a single batch query.
+    Args:
+        client: BigQuery client
+        table_id: BigQuery table ID
+        pairs: List of (id1, id2) tuples to check
+    Returns:
+        set: Set of (id1, id2) tuples that already exist
+    """
+    if not pairs:
+        return set()
+    # Build a series of OR conditions
+    conditions = " OR ".join([f"(id1 = '{id1}' AND id2 = '{id2}')" for id1, id2 in pairs])
+    query = f"""
+        SELECT id1, id2 FROM {table_id}
+        WHERE {conditions}
+    """
+    results = client.query(query).result()
+    return {(row.id1, row.id2) for row in results}
 
-def process_pair_simple(args):
+def process_pair(args):
     """
     Simplified process_pair function that only takes protein paths and runs TM-align fresh.
     """
     table_id, bucket_name, use_gpu, protein_pair = args
-    
     # Unpack protein pair
     pdb1_gcs_path, pdb2_gcs_path = protein_pair
     protein_id1 = os.path.splitext(os.path.basename(pdb1_gcs_path))[0]
     protein_id2 = os.path.splitext(os.path.basename(pdb2_gcs_path))[0]
     start_time = time.time()
-    
-    # Check if pair exists
-    query = f"""
-        SELECT id1 FROM {table_id}
-        WHERE id1 = '{protein_id1}' AND id2 = '{protein_id2}'
-    """
-    results = client.query(query).result()
-    row = next(results, None)
-    if row is not None:
-        elapsed = time.time() - start_time
-        print(f"Skipping {protein_id1}, {protein_id2} (already in table) [Time: {elapsed:.2f}s]")
-        return None
-    
-    # If not exists, process the pair
     try:
         temp_extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
         # Run TM-align fresh (no pre-computed alignments)
-        result = temp_extractor.process_protein_pair(pdb1_gcs_path, pdb2_gcs_path)
+        result = temp_extractor.score_protein_pair(pdb1_gcs_path, pdb2_gcs_path)
         elapsed = time.time() - start_time
         print(f"Processed {protein_id1}, {protein_id2} [Time: {elapsed:.2f}s]")
         return result
@@ -278,8 +281,9 @@ def main():
     # Configuration - modify these variables as needed
     input_csv = "SWISS_MODEL/tm_score_comparison_results.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
     bucket_name = "jx-compbio"  # GCS bucket name
-    pdb_folder = "SWISS_MODEL/pdbs"  # GCS folder containing PDB files
-    max_pairs = 100  # Maximum number of pairs to process from CSV (None for all)
+    pdb_folder = "SWISS_MODEL/pdbs"  # GCS folder containing PDB files 
+    table_id = "mit-primes-464001.primes_data.ground_truth_scores" # BigQuery table id
+    max_pairs = 10  # Maximum number of pairs to process from CSV (None for all)
     batch_size = 32  # Number of pairs to process in each batch
     use_gpu = True  # Whether to use GPU acceleration
     num_processes = None  # Number of processes for parallel processing (None = auto)
@@ -288,22 +292,12 @@ def main():
     extractor = LDDTExtractor(bucket_name, use_gpu=use_gpu)
 
     # Read CSV file directly from GCS
-    print(f"Reading CSV file from GCS: {input_csv}")
     try:
-        csv_file = extractor.read_pdb_from_gcs(input_csv)
-        print(f"CSV file opened successfully")
+        csv_file = extractor.read_from_gcs(input_csv)
     except Exception as e:
         print(f"Error reading CSV file: {e}")
         print(f"Make sure the file '{input_csv}' exists in bucket '{bucket_name}'")
         return
-
-    # BigQuery setup
-    table_id = "mit-primes-464001.primes_data.ground_truth_scores"  # <-- Set your table here
-    try:
-        client.get_table(table_id)
-        print(f"Table {table_id} exists.")
-    except NotFound:
-        print(f"ERROR: Table {table_id} does not exist.")
 
     print(f"Processing protein pairs in batches of {batch_size}...")
 
@@ -316,21 +310,36 @@ def main():
         print(f"Processing batch {batch_idx + 1} ({len(protein_pairs_batch)} pairs)... (starting at line {batch_start_line})")
         last_line_processed = batch_start_line + len(protein_pairs_batch) - 1
 
+        # Extract just the IDs for batch existence check
+        id_pairs = [
+            (os.path.splitext(os.path.basename(p1))[0], os.path.splitext(os.path.basename(p2))[0])
+            for p1, p2 in protein_pairs_batch
+        ]
+        existing_pairs = batch_check_existing_pairs(client, table_id, id_pairs)
+        # Filter out pairs that already exist
+        filtered_pairs = [
+            pair for pair, id_pair in zip(protein_pairs_batch, id_pairs)
+            if id_pair not in existing_pairs
+        ]
+        if not filtered_pairs:
+            print("All pairs in this batch already exist in BigQuery, skipping batch.")
+            continue
+
         # Prepare arguments for each pair (simplified - just protein paths)
         pool_args = [
             (table_id, bucket_name, use_gpu, protein_pair)
-            for protein_pair in protein_pairs_batch
+            for protein_pair in filtered_pairs
         ]
-        # Multiprocess: check pair_exists and process if not exists
+        # Multiprocess: only process new pairs
         batch_start_time = time.time()
         with torch_mp.Pool(processes=num_processes or min(mp.cpu_count(), len(pool_args))) as pool:
-            batch_results = pool.map(process_pair_simple, pool_args)
+            batch_results = pool.map(process_pair, pool_args)
         batch_elapsed = time.time() - batch_start_time
         # Filter out None results (skipped or failed)
         batch_results = [r for r in batch_results if r is not None]
-        processed_count += len(protein_pairs_batch)
+        processed_count += len(filtered_pairs)
         successful_count += len(batch_results)
-        failed_count += len(protein_pairs_batch) - len(batch_results)
+        failed_count += len(filtered_pairs) - len(batch_results)
 
         # Insert batch directly into BigQuery
         if batch_results:
