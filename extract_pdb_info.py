@@ -7,16 +7,16 @@ import multiprocessing as mp
 import os
 import base64
 import time
-try:
-    from google.colab import auth
-    auth.authenticate_user()
-except ImportError:
-    print("Not running in Colab - skipping authentication")
-    print("Make sure you have proper GCS credentials set up")
+# try:
+#     from google.colab import auth
+#     auth.authenticate_user()
+# except ImportError:
+#     print("Not running in Colab - skipping authentication")
+#     print("Make sure you have proper GCS credentials set up")
 
 BUCKET_NAME = "jx-compbio" 
 PDB_FOLDER = "SWISS_MODEL/pdbs"
-INPUT_CSV = "SWISS_MODEL/tm_score_comparison_results.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
+INPUT_CSV = "SWISS_MODEL/swiss_under_300_141M.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
 BATCH_SIZE = 1000
 TABLE_ID = "mit-primes-464001.primes_data.pdb_info"
 MAX_ROWS = 1000000
@@ -28,10 +28,11 @@ three_to_one = {
     'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
     'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
 }
+key_path = "mit-primes-464001-bfa03c2c5999.json"
 parser = PDBParser(QUIET=True)
-storage_client = storage.Client()
+storage_client = storage.Client.from_service_account_json(key_path)
 bucket = storage_client.bucket(BUCKET_NAME)
-bq_client = bigquery.Client(project="mit-primes-464001")
+bq_client = bigquery.Client.from_service_account_json(key_path)
 
 
 def extract_ca_coords_and_sequence(pdb):
