@@ -11,8 +11,9 @@ from tmtools import tm_align
 from lddt import LDDTCalculator
 from google.cloud import bigquery
 import time
+from alignment_utils import parse_alignment_from_sequences
 
-start_line = 0  # Line to start from
+start_line = 1000000  # Line to start from
 max_pairs = 1000000  # Maximum number of pairs to process from CSV (None for all)
 key_path = "mit-primes-464001-bfa03c2c5999.json"
 client = bigquery.Client.from_service_account_json(key_path) 
@@ -88,8 +89,11 @@ class LDDTExtractor:
             result = tm_align(reference_coords_all, model_coords_all, reference_seq, model_seq)
             tm_score = result.tm_norm_chain1
 
-            # Parse alignment pairs using parse_tm_align_result
-            alignment_pairs = self.parse_tm_align_result(result)
+            # Parse alignment pairs using parse_alignment_from_sequences
+            seqxA = result.seqxA
+            seqM = result.seqM
+            seqyA = result.seqyA
+            alignment_pairs = parse_alignment_from_sequences(seqxA, seqM, seqyA)
 
             # Load all aligned Cα coordinates
             model_coords = np.array([model_coords_all[i] for _, i in alignment_pairs])
@@ -109,32 +113,16 @@ class LDDTExtractor:
                 'id1': protein_id1,
                 'id2': protein_id2,
                 'tm_score': tm_score,
-                'seqxA': result.seqxA,
-                'seqM': result.seqM,
-                'seqyA': result.seqyA,
+                'seqxA': seqxA,
+                'seqM': seqM,
+                'seqyA': seqyA,
                 'lddt_scores': lddt_scores_padded.tolist()
             }
         except Exception as e:
             print(f"Error processing {protein_id1} vs {protein_id2}: {e}")
             return None
 
-    def parse_tm_align_result(self, result):
-        """
-        Parse TM-align result to get residue alignment.
-        """
-        alignment = []
-        idx1 = idx2 = 0
-        for a1, a2, ann in zip(result.seqxA, result.seqyA, result.seqM):
-            if a1 != '-' and a2 != '-':
-                if ann in [':', '.']:
-                    alignment.append((idx1, idx2))
-                idx1 += 1
-                idx2 += 1
-            elif a1 == '-' and a2 != '-':
-                idx2 += 1
-            elif a1 != '-' and a2 == '-':
-                idx1 += 1
-        return alignment
+
 
 
 # Initialize extractor with GPU support

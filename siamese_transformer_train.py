@@ -5,233 +5,28 @@ import numpy as np
 import os
 import pandas as pd
 import json
+import io
 from tqdm import tqdm
 
-from siamese_transformer_model import SiameseTransformerNet, LightweightTransformerNet
+from siamese_transformer_model import SiameseTransformerNet
 from siamese_dataset import SiameseProteinDataset
-from siamese_loss import SiameseLDDTLoss
+from siamese_loss import TMLDDTLoss
 
-def create_sample_data(num_samples=10, seq_len=300, prottrans_dim=1024):
-    """
-    Create sample data for testing the training pipeline.
-    In practice, you would load real ProtTrans embeddings and PDB files.
-    """
-    protein_data = []
-    
-    for i in range(num_samples):
-        # Create dummy ProtTrans embeddings
-        prot1_embeddings = np.random.randn(seq_len, prottrans_dim).astype(np.float32)
-        prot2_embeddings = np.random.randn(seq_len, prottrans_dim).astype(np.float32)
-        
-        # Use existing PDB files for testing
-        prot1_pdb = "Q1GF61.pdb"
-        prot2_pdb = "Q3K3S2.pdb"
-        
-        protein_data.append({
-            'protein1_id': f'protein_{i}_1',
-            'protein2_id': f'protein_{i}_2',
-            'prot1_embeddings': prot1_embeddings,
-            'prot2_embeddings': prot2_embeddings,
-            'prot1_pdb': prot1_pdb,
-            'prot2_pdb': prot2_pdb
-        })
-    
-    return protein_data
+# --- BigQuery setup ---
+from google.cloud import bigquery
+key_path = "mit-primes-464001-bfa03c2c5999.json"  # Update if needed
+bq_client = bigquery.Client.from_service_account_json(key_path)
+ground_truth_table = "mit-primes-464001.primes_data.ground_truth_scores"  # Update if needed
 
-def load_data_from_csv(csv_path, max_samples=None):
+
+def train_transformer_siamese_network(max_samples=None, bq_client=None, ground_truth_table=None, config=None):
     """
-    Load protein data from CSV with ground truth LDDT and TM scores.
+    Train the transformer-based Siamese network with batched data loading.
     
     Args:
-        csv_path: Path to CSV file with results from extract_lddt_scores.py
         max_samples: Maximum number of samples to load (None for all)
-    
-    Returns:
-        List of protein pair data dictionaries
-    """
-    print(f"Loading data from {csv_path}...")
-    
-    # Read CSV file
-    df = pd.read_csv(csv_path)
-    
-    if max_samples:
-        df = df.head(max_samples)
-    
-    protein_data = []
-    
-    for idx, row in df.iterrows():
-        try:
-            # Extract protein IDs
-            protein1_id = row['protein_id1']
-            protein2_id = row['protein_id2']
-            
-            # Extract TM score
-            tm_score = float(row['tm_score']) if pd.notna(row['tm_score']) else 0.0
-            
-            # Extract LDDT scores (JSON string)
-            lddt_scores_str = row['lddt_scores_protein2']
-            lddt_scores = json.loads(lddt_scores_str) if isinstance(lddt_scores_str, str) else []
-            
-            # Extract alignment sequences
-            seqxA = row['seqxA']
-            seqyA = row['seqyA']
-            seqM = row['seqM']
-            
-            # Create dummy ProtTrans embeddings (in practice, you'd load real ones)
-            seq_len = len(seqyA.replace('-', ''))  # Length of target protein
-            prottrans_dim = 1024
-            
-            # Create embeddings for both proteins
-            prot1_embeddings = np.random.randn(seq_len, prottrans_dim).astype(np.float32)
-            prot2_embeddings = np.random.randn(seq_len, prottrans_dim).astype(np.float32)
-            
-            # Create PDB file paths
-            prot1_pdb = f"{protein1_id}.pdb"
-            prot2_pdb = f"{protein2_id}.pdb"
-            
-            protein_data.append({
-                'protein1_id': protein1_id,
-                'protein2_id': protein2_id,
-                'prot1_embeddings': prot1_embeddings,
-                'prot2_embeddings': prot2_embeddings,
-                'prot1_pdb': prot1_pdb,
-                'prot2_pdb': prot2_pdb,
-                'tm_score': tm_score,
-                'lddt_scores': np.array(lddt_scores, dtype=np.float32),
-                'seqxA': seqxA,
-                'seqyA': seqyA,
-                'seqM': seqM
-            })
-            
-        except Exception as e:
-            print(f"Error processing row {idx}: {e}")
-            continue
-    
-    print(f"Loaded {len(protein_data)} protein pairs")
-    return protein_data
-
-class CustomTMLDDTLoss(torch.nn.Module):
-    """
-    Custom loss function that combines TM and LDDT scores based on TM score ranges.
-    """
-    def __init__(self, alpha=0.7, beta=0.3):
-        super().__init__()
-        self.alpha = alpha  # Weight for per-residue loss
-        self.beta = beta    # Weight for global loss
-        
-    def forward(self, new_emb1, new_emb2, global_emb1, global_emb2, 
-                tm_scores, lddt_scores, alignment_mask, alignment):
-        """
-        Compute loss based on TM score ranges.
-        
-        Args:
-            new_emb1, new_emb2: Per-residue embeddings
-            global_emb1, global_emb2: Global embeddings
-            tm_scores: TM scores for each protein pair
-            lddt_scores: LDDT scores for each residue
-            alignment_mask: Mask for aligned residues
-            alignment: Alignment information
-        """
-        batch_size = tm_scores.shape[0]
-        total_loss = 0.0
-        total_residue_loss = 0.0
-        total_global_loss = 0.0
-        valid_pairs = 0
-        
-        for i in range(batch_size):
-            tm_score = tm_scores[i].item()
-            
-            # Skip pairs with TM score < 0.1 (too chaotic)
-            if tm_score < 0.1:
-                continue
-            
-            valid_pairs += 1
-            
-            # Compute cosine similarity for global embeddings
-            global_sim = torch.cosine_similarity(global_emb1[i], global_emb2[i], dim=0)
-            
-            # Target similarity based on TM score
-            target_sim = torch.tensor(tm_score, device=global_sim.device)
-            
-            # Global loss (always use TM score)
-            global_loss = torch.nn.functional.mse_loss(global_sim, target_sim)
-            
-            # Per-residue loss
-            if tm_score >= 0.4:
-                # Use combination of TM and LDDT scores
-                residue_loss = self._compute_residue_loss_with_lddt(
-                    new_emb1[i], new_emb2[i], lddt_scores[i], alignment_mask[i], alignment[i]
-                )
-            else:
-                # Use only TM score for per-residue loss
-                residue_loss = self._compute_residue_loss_tm_only(
-                    new_emb1[i], new_emb2[i], tm_score, alignment_mask[i]
-                )
-            
-            # Combine losses
-            pair_loss = self.alpha * residue_loss + self.beta * global_loss
-            
-            total_loss += pair_loss
-            total_residue_loss += residue_loss
-            total_global_loss += global_loss
-        
-        if valid_pairs == 0:
-            return torch.tensor(0.0, device=new_emb1.device, requires_grad=True), {
-                'residue_loss': torch.tensor(0.0, device=new_emb1.device),
-                'global_loss': torch.tensor(0.0, device=new_emb1.device)
-            }
-        
-        avg_loss = total_loss / valid_pairs
-        avg_residue_loss = total_residue_loss / valid_pairs
-        avg_global_loss = total_global_loss / valid_pairs
-        
-        return avg_loss, {
-            'residue_loss': avg_residue_loss,
-            'global_loss': avg_global_loss
-        }
-    
-    def _compute_residue_loss_with_lddt(self, emb1, emb2, lddt_scores, alignment_mask, alignment):
-        """Compute per-residue loss using LDDT scores."""
-        # Use LDDT scores as target similarities
-        target_scores = torch.tensor(lddt_scores, device=emb1.device, dtype=torch.float32)
-        
-        # Compute cosine similarities between aligned residues
-        aligned_emb1 = emb1[alignment_mask]
-        aligned_emb2 = emb2[alignment_mask]
-        aligned_targets = target_scores[alignment_mask]
-        
-        if len(aligned_emb1) == 0:
-            return torch.tensor(0.0, device=emb1.device)
-        
-        similarities = torch.cosine_similarity(aligned_emb1, aligned_emb2, dim=1)
-        loss = torch.nn.functional.mse_loss(similarities, aligned_targets)
-        
-        return loss
-    
-    def _compute_residue_loss_tm_only(self, emb1, emb2, tm_score, alignment_mask):
-        """Compute per-residue loss using only TM score."""
-        # Use TM score as target for all aligned residues
-        target_score = torch.tensor(tm_score, device=emb1.device, dtype=torch.float32)
-        
-        # Compute cosine similarities between aligned residues
-        aligned_emb1 = emb1[alignment_mask]
-        aligned_emb2 = emb2[alignment_mask]
-        
-        if len(aligned_emb1) == 0:
-            return torch.tensor(0.0, device=emb1.device)
-        
-        similarities = torch.cosine_similarity(aligned_emb1, aligned_emb2, dim=1)
-        target_scores = target_score.expand(len(similarities))
-        loss = torch.nn.functional.mse_loss(similarities, target_scores)
-        
-        return loss
-
-def train_transformer_siamese_network(protein_data, config):
-    """
-    Train the transformer-based Siamese network.
-    
-    Args:
-        protein_data: List of protein pair data
+        bq_client: BigQuery client
+        ground_truth_table: BigQuery table name
         config: Training configuration dictionary
     """
     # Set device
@@ -240,19 +35,20 @@ def train_transformer_siamese_network(protein_data, config):
     
     # Create dataset
     dataset = SiameseProteinDataset(
-        protein_data=protein_data,
+        max_samples=max_samples,
+        bq_client=bq_client,
+        ground_truth_table=ground_truth_table, 
         max_seq_len=config['max_seq_len'],
-        prottrans_dim=config['prottrans_dim']
+        prottrans_dim=config['prottrans_dim'],
+        data_batch_size=config.get('data_batch_size', 32)
     )
-    
-    print(f"Dataset size: {len(dataset)}")
     
     # Create dataloader
     dataloader = DataLoader(
         dataset,
         batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers']
+        shuffle=False,
+        num_workers=0  # Set to 0 to avoid multiprocessing issues with BigQuery
     )
     
     # Create model
@@ -267,7 +63,7 @@ def train_transformer_siamese_network(protein_data, config):
     ).to(device)
     
     # Create custom loss function
-    criterion = CustomTMLDDTLoss(
+    criterion = TMLDDTLoss(
         alpha=config['alpha'],
         beta=config['beta']
     ).to(device)
@@ -292,6 +88,7 @@ def train_transformer_siamese_network(protein_data, config):
         total_loss = 0.0
         total_residue_loss = 0.0
         total_global_loss = 0.0
+        pairs_processed = 0
         
         progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{config["num_epochs"]}')
         
@@ -301,10 +98,15 @@ def train_transformer_siamese_network(protein_data, config):
             prot2_embeddings = batch['prot2_embeddings'].to(device)
             prot1_mask = batch['prot1_mask'].to(device)
             prot2_mask = batch['prot2_mask'].to(device)
-            tm_scores = batch['tm_scores'].to(device)
+            tm_scores = batch['tm_score'].to(device)
             lddt_scores = batch['lddt_scores'].to(device)
-            alignment_mask = batch['alignment_mask'].to(device)
-            alignment = batch['alignment']
+            seqxA_list = batch['seqxA']
+            seqM_list = batch['seqM']
+            seqyA_list = batch['seqyA']
+            
+            # Count actual pairs in this batch
+            batch_size = len(seqxA_list)
+            pairs_processed += batch_size
             
             # Forward pass with masks
             new_emb1, new_emb2, global_emb1, global_emb2 = model(
@@ -314,7 +116,7 @@ def train_transformer_siamese_network(protein_data, config):
             # Compute loss
             loss, loss_dict = criterion(
                 new_emb1, new_emb2, global_emb1, global_emb2,
-                tm_scores, lddt_scores, alignment_mask, alignment
+                tm_scores, lddt_scores, seqxA_list, seqM_list, seqyA_list
             )
             
             # Backward pass
@@ -335,13 +137,14 @@ def train_transformer_siamese_network(protein_data, config):
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'Residue': f'{loss_dict["residue_loss"].item():.4f}',
-                'Global': f'{loss_dict["global_loss"].item():.4f}'
+                'Global': f'{loss_dict["global_loss"].item():.4f}',
+                'Pairs': pairs_processed
             })
         
         # Compute average losses
-        avg_loss = total_loss / len(dataloader)
-        avg_residue_loss = total_residue_loss / len(dataloader)
-        avg_global_loss = total_global_loss / len(dataloader)
+        avg_loss = total_loss / pairs_processed
+        avg_residue_loss = total_residue_loss / pairs_processed
+        avg_global_loss = total_global_loss / pairs_processed
         
         # Update learning rate
         scheduler.step(avg_loss)
@@ -381,29 +184,25 @@ def main():
         'nhead': 4,                 # Number of attention heads
         'num_layers': 2,            # Number of transformer layers
         'dropout': 0.1,             # Dropout rate
-        'batch_size': 32,           # Batch size
+        'batch_size': 32,           # Batch size for training
+        'data_batch_size': 32,      # Batch size for data loading from CSV/BigQuery
         'num_epochs': 16,           # Number of training epochs
         'learning_rate': 1e-4,      # Learning rate
         'weight_decay': 1e-5,       # Weight decay
         'max_grad_norm': 1.0,       # Gradient clipping
         'alpha': 0.7,               # Weight for per-residue loss
         'beta': 0.3,                # Weight for global loss
-        'num_workers': 0,           # Number of data loading workers
+        'num_workers': 4,           # Number of data loading workers
         'model_save_path': 'siamese_transformer_best.pth'  # Path to save best model
     }
     
-    # Load data from CSV
-    csv_path = "results.csv"  # Path to your results CSV from extract_lddt_scores.py
-    protein_data = load_data_from_csv(csv_path, max_samples=100)  # Load first 100 samples
-    
+    # Load data from CSV and BigQuery
     print(f"Training SiameseTransformerNet with custom TM/LDDT loss...")
     print("Loss strategy:")
     print("- TM < 0.1: No loss (too chaotic)")
     print("- TM 0.1-0.4: TM score only")
     print("- TM 0.4-1.0: TM + LDDT scores")
-    
-    model = train_transformer_siamese_network(protein_data, config)
-    
+    model = train_transformer_siamese_network(max_samples=100, bq_client=bq_client, ground_truth_table=ground_truth_table, config=config)
     print("Training completed!")
     print(f"Best model saved to: {config['model_save_path']}")
 
