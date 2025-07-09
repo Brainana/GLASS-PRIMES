@@ -1,103 +1,148 @@
 import torch
 import numpy as np
-from siamese_model import SiameseResidueNet
+from siamese_transformer_model import SiameseTransformerNet
 import pickle
 import os
+import torch.nn.functional as F
 
-class ProteinEmbeddingGenerator:
+
+class SiameseInference:
     """
-    Class for generating new protein embeddings using the trained Siamese network.
+    Class for inference with trained Siamese transformer models.
     """
-    def __init__(self, model_path, config):
+    def __init__(self, model_path):
         """
-        Initialize the embedding generator.
+        Initialize the inference class.
         
         Args:
             model_path: Path to the trained model checkpoint
-            config: Model configuration dictionary
         """
+        self.model_path = model_path
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.config = config
         
-        # Load model
-        self.model = SiameseResidueNet(
-            input_dim=config['prottrans_dim'],
-            hidden_dim=config['hidden_dim'],
-            output_dim=config['output_dim']
-        ).to(self.device)
-        
-        # Load trained weights
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load model and config
+        self.model, self.config = self._load_trained_model(model_path)
+        self.model = self.model.to(self.device)
         self.model.eval()
         
-        print(f"Model loaded from {model_path}")
+        print(f"Transformer model loaded from {model_path}")
         print(f"Using device: {self.device}")
     
-    def pad_embeddings(self, embeddings, max_seq_len):
+    def _load_trained_model(self, model_path):
         """
-        Pad embeddings to a fixed length.
+        Load the trained transformer model from checkpoint.
         
         Args:
-            embeddings: ProtTrans embeddings [seq_len, prottrans_dim]
-            max_seq_len: Maximum sequence length for padding
-        
+            model_path: Path to the .pth checkpoint file
+            
         Returns:
-            padded_embeddings: Padded embeddings [max_seq_len, prottrans_dim]
+            model: Loaded model
+            config: Model configuration
         """
-        seq_len, dim = embeddings.shape
+        print(f"Loading transformer model from {model_path}...")
         
-        if seq_len >= max_seq_len:
-            # Truncate
-            padded = embeddings[:max_seq_len]
-        else:
-            # Pad with zeros
-            padded = np.zeros((max_seq_len, dim))
-            padded[:seq_len] = embeddings
+        checkpoint = torch.load(model_path, map_location='cpu')
+        config = checkpoint['config']
         
-        return padded
+        # Create SiameseTransformerNet model
+        model = SiameseTransformerNet(
+            input_dim=config['prottrans_dim'],
+            hidden_dim=config['hidden_dim'],
+            output_dim=config['output_dim'],
+            nhead=config['nhead'],
+            num_layers=config['num_layers'],
+            dropout=config['dropout'],
+            max_seq_len=config['max_seq_len']
+        )
+        
+        # Load trained weights
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        print(f"Model loaded successfully!")
+        print(f"Training loss: {checkpoint['loss']:.4f}")
+        print(f"Epoch: {checkpoint['epoch']}")
+        
+        return model, config
     
-    def generate_embedding(self, prottrans_embeddings):
+    def compute_similarity_scores(self, prot1_emb, prot2_emb, prot1_mask=None, prot2_mask=None):
         """
-        Generate new embedding for a single protein.
+        Compute similarity scores between protein embeddings.
+        
+        Args:
+            prot1_emb, prot2_emb: Protein embeddings
+            prot1_mask, prot2_mask: Attention masks
+            
+        Returns:
+            global_sim: Global similarity score
+            residue_sims: Per-residue similarity scores
+        """
+        with torch.no_grad():
+            # Forward pass through transformer with masks
+            new_emb1, new_emb2, global_emb1, global_emb2 = self.model(
+                prot1_emb, prot2_emb, prot1_mask, prot2_mask
+            )
+            
+            # Compute global similarity
+            global_sim = F.cosine_similarity(global_emb1, global_emb2, dim=1)
+            
+            # Compute per-residue similarities
+            residue_sims = F.cosine_similarity(new_emb1, new_emb2, dim=2)
+            
+            return global_sim, residue_sims
+    
+    def create_mask_from_length(self, seq_len, max_len=None):
+        """
+        Create a mask from sequence length.
+        
+        Args:
+            seq_len: Actual sequence length
+            max_len: Maximum sequence length (if None, uses seq_len)
+            
+        Returns:
+            mask: Mask tensor [max_len] (1 for real residues, 0 for padding)
+        """
+        if max_len is None:
+            max_len = seq_len
+        
+        mask = torch.zeros(max_len, device=self.device)
+        mask[:seq_len] = 1
+        return mask
+    
+    def get_protein_embedding(self, prottrans_embeddings, mask=None, seq_len=None):
+        """
+        Get embedding for a single protein (for inference).
         
         Args:
             prottrans_embeddings: ProtTrans embeddings [seq_len, prottrans_dim]
-        
+            mask: Optional mask [seq_len] (1 for real residues, 0 for padding)
+            seq_len: Optional actual sequence length (used to create mask if mask is None)
+            
         Returns:
-            new_embedding: New protein embedding [output_dim]
+            embedding: Protein embedding [output_dim]
         """
-        # Pad embeddings
-        padded_embeddings = self.pad_embeddings(
-            prottrans_embeddings, self.config['max_seq_len']
-        )
+        # For transformer model, we need to handle masks properly
+        total_len = prottrans_embeddings.size(0)
         
-        # Convert to tensor
-        embeddings_tensor = torch.FloatTensor(padded_embeddings).unsqueeze(0).to(self.device)
+        if mask is None:
+            if seq_len is not None:
+                # Create mask from actual sequence length
+                mask = self.create_mask_from_length(seq_len, total_len)
+            else:
+                # If no mask or seq_len provided, assume all positions are real (no padding)
+                mask = torch.ones(total_len, device=self.device)
+        else:
+            # Ensure mask is on the correct device
+            mask = mask.to(self.device)
         
-        # Generate embedding
-        with torch.no_grad():
-            new_embedding = self.model.get_protein_embedding(embeddings_tensor)
+        # Add batch dimension
+        embeddings = prottrans_embeddings.unsqueeze(0).to(self.device)
+        mask = mask.unsqueeze(0)
         
-        return new_embedding.cpu().numpy()
-    
-    def generate_embeddings_batch(self, prottrans_embeddings_list):
-        """
-        Generate embeddings for a batch of proteins.
-        
-        Args:
-            prottrans_embeddings_list: List of ProtTrans embeddings
-        
-        Returns:
-            new_embeddings: List of new protein embeddings
-        """
-        new_embeddings = []
-        
-        for embeddings in prottrans_embeddings_list:
-            new_emb = self.generate_embedding(embeddings)
-            new_embeddings.append(new_emb)
-        
-        return new_embeddings
+        # Process through transformer
+        _, _, global_emb, _ = self.model(embeddings, embeddings, mask, mask)
+        return global_emb.squeeze(0)  # [output_dim]
+
 
 class VectorDatabase:
     """
@@ -195,18 +240,21 @@ def main():
     # Configuration (should match training config)
     config = {
         'prottrans_dim': 1024,
-        'max_seq_len': 512,
-        'hidden_dim': 256,
-        'output_dim': 128
+        'max_seq_len': 300,
+        'hidden_dim': 512,
+        'output_dim': 512,
+        'nhead': 4,
+        'num_layers': 2,
+        'dropout': 0.1
     }
     
-    # Initialize embedding generator
-    model_path = 'siamese_model_best.pth'
+    # Initialize inference
+    model_path = 'siamese_transformer_best.pth'
     if not os.path.exists(model_path):
         print(f"Model file {model_path} not found. Please train the model first.")
         return
     
-    generator = ProteinEmbeddingGenerator(model_path, config)
+    inference = SiameseInference(model_path)
     
     # Initialize vector database
     db = VectorDatabase(config['output_dim'])
@@ -216,21 +264,21 @@ def main():
     
     # Create sample ProtTrans embeddings (in practice, load real ones)
     sample_proteins = {
-        'protein_1': np.random.randn(150, config['prottrans_dim']).astype(np.float32),
-        'protein_2': np.random.randn(200, config['prottrans_dim']).astype(np.float32),
-        'protein_3': np.random.randn(180, config['prottrans_dim']).astype(np.float32),
+        'protein_1': torch.randn(150, config['prottrans_dim']),
+        'protein_2': torch.randn(200, config['prottrans_dim']),
+        'protein_3': torch.randn(180, config['prottrans_dim']),
     }
     
     # Generate new embeddings and add to database
     for protein_id, embeddings in sample_proteins.items():
-        new_embedding = generator.generate_embedding(embeddings)
-        db.add_protein(protein_id, new_embedding)
+        new_embedding = inference.get_protein_embedding(embeddings, seq_len=embeddings.size(0))
+        db.add_protein(protein_id, new_embedding.cpu().numpy())
         print(f"Added {protein_id} to database")
     
     # Example search
     print("\nPerforming similarity search...")
-    query_embedding = generator.generate_embedding(sample_proteins['protein_1'])
-    results = db.search_similar(query_embedding, top_k=3)
+    query_embedding = inference.get_protein_embedding(sample_proteins['protein_1'], seq_len=150)
+    results = db.search_similar(query_embedding.cpu().numpy(), top_k=3)
     
     print("Top similar proteins:")
     for protein_id, similarity in results:
