@@ -9,10 +9,22 @@ import time
 import os
 from tqdm import tqdm
 import base64
+import pickle
+import os
+import json
 
 # Configuration
+PROJECT = "mit-primes-464001"
+DATASET = "primes_data"
+TABLE = "pdb_info"
+TABLE_ID = f"{PROJECT}.{DATASET}.{TABLE}"
+
+# New embeddings table
+EMBEDDINGS_TABLE = "embeddings"
+EMBEDDINGS_TABLE_ID = f"{PROJECT}.{DATASET}.{EMBEDDINGS_TABLE}"
+
+# BigQuery authentication
 key_path = "mit-primes-464001-bfa03c2c5999.json"
-TABLE_ID = "mit-primes-464001.primes_data.pdb_info"
 
 # ProtBERT configuration
 MODEL_NAME = "Rostlab/prot_t5_xl_uniref50"
@@ -94,9 +106,9 @@ def fetch_sequences_batch(client, protein_ids, batch_size=100):
     results = client.query(query).result()
     return {row.id: row.seq for row in results}
 
-def check_existing_embeddings(client, protein_ids):
+def check_existing_embeddings_in_embeddings_table(client, protein_ids):
     """
-    Check which protein IDs already have embeddings.
+    Check which protein IDs already have embeddings in the embeddings table.
     
     Args:
         client: BigQuery client
@@ -111,63 +123,111 @@ def check_existing_embeddings(client, protein_ids):
     id_list = ', '.join([f"'{id_}'" for id_ in protein_ids])
     query = f"""
         SELECT id 
-        FROM `{TABLE_ID}` 
-        WHERE id IN ({id_list}) 
+        FROM `{EMBEDDINGS_TABLE_ID}` 
+        WHERE id IN ({id_list})
         AND embeddings IS NOT NULL
     """
     
     results = client.query(query).result()
     return {row.id for row in results}
 
-def update_embeddings_batch(client, updates_batch):
+def save_embeddings_batch(embeddings_batch, batch_num):
     """
-    Update embeddings for a batch of proteins using a single MERGE statement.
+    Save embeddings to local files for batch loading.
+    
+    Args:
+        embeddings_batch: List of dicts with 'id' and 'embeddings' keys
+        batch_num: Batch number for file naming
+    
+    Returns:
+        Path to saved file
+    """
+    if not embeddings_batch:
+        return None
+    
+    # Create embeddings directory
+    os.makedirs('embeddings_temp', exist_ok=True)
+    
+    # Convert embeddings to base64 strings for JSON serialization
+    json_batch = []
+    for item in embeddings_batch:
+        json_batch.append({
+            'id': item['id'],
+            'embeddings': base64.b64encode(item['embeddings']).decode('utf-8')
+        })
+    
+    # Save batch to newline-delimited JSON file (one JSON object per line)
+    filename = f'embeddings_temp/batch_{batch_num:06d}.json'
+    with open(filename, 'w') as f:
+        for item in json_batch:
+            f.write(json.dumps(item) + '\n')
+    
+    print(f"Saved batch {batch_num} to {filename}")
+    return filename
+
+def upload_files_to_bigquery(client, file_paths):
+    """
+    Upload multiple files to BigQuery using load jobs.
     
     Args:
         client: BigQuery client
-        updates_batch: List of dicts with 'id' and 'embeddings' keys
+        file_paths: List of file paths to upload
     """
-    if not updates_batch:
+    if not file_paths:
         return
     
-    # Convert all embeddings to base64 strings
-    rows_data = []
-    for update in updates_batch:
-        protein_id = update['id']
-        embeddings_bytes = update['embeddings']
-        embeddings_b64 = base64.b64encode(embeddings_bytes).decode('utf-8')
-        rows_data.append({
-            'id': protein_id,
-            'embeddings_b64': embeddings_b64
-        })
+    start_time = time.time()
+    print(f"Uploading {len(file_paths)} files to BigQuery...")
     
-    # Create a single MERGE statement with base64 strings
-    merge_query = f"""
-    MERGE `{TABLE_ID}` T
-    USING UNNEST(@rows) AS S
-    ON T.id = S.id
-    WHEN MATCHED THEN
-      UPDATE SET embeddings = FROM_BASE64(S.embeddings_b64)
-    """
-    
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ArrayQueryParameter(
-                "rows",
-                "STRUCT<id STRING, embeddings_b64 STRING>",
-                rows_data
-            )
-        ]
+    # Configure the load job
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        schema=[
+            bigquery.SchemaField("id", "STRING"),
+            bigquery.SchemaField("embeddings", "BYTES")
+        ],
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
     
-    client.query(merge_query, job_config=job_config).result()
+    successful_uploads = 0
+    failed_uploads = 0
+    
+    for file_path in file_paths:
+        try:
+            with open(file_path, 'rb') as source_file:
+                job = client.load_table_from_file(
+                    source_file, EMBEDDINGS_TABLE_ID, job_config=job_config
+                )
+                job.result()  # Wait for the job to complete
+                successful_uploads += 1
+                print(f"Successfully uploaded {file_path}")
+                
+                # Clean up the file after successful upload
+                os.remove(file_path)
+                
+        except Exception as e:
+            failed_uploads += 1
+            print(f"Failed to upload {file_path}: {e}")
+    
+    print(f"Upload completed: {successful_uploads} successful, {failed_uploads} failed")
+    elapsed_time = time.time() - start_time
+    print(f"{elapsed_time:.2f}s")
+    
+    # Clean up empty directory if all files were processed
+    if os.path.exists('embeddings_temp') and not os.listdir('embeddings_temp'):
+        os.rmdir('embeddings_temp')
 
-def main():
+def main(max_embeddings=None):
     """
-    Main function to update pdb_info table with ProtBERT embeddings.
+    Main function to generate and insert ProtBERT embeddings into embeddings table.
+    
+    Args:
+        max_embeddings: Maximum number of embeddings to generate (for testing)
     """
-    print(f"Starting embedding update for table: {TABLE_ID}")
+    print(f"Starting embedding generation for table: {EMBEDDINGS_TABLE_ID}")
     print(f"Using device: {device}")
+    if max_embeddings:
+        print(f"Limiting to {max_embeddings} embeddings for testing")
     
     # Initialize BigQuery client
     client = bigquery.Client.from_service_account_json(key_path)
@@ -175,8 +235,11 @@ def main():
     # Get total count of proteins that need embeddings
     count_query = f"""
         SELECT COUNT(*) as total_count
-        FROM `{TABLE_ID}`
-        WHERE embeddings IS NULL
+        FROM `{TABLE_ID}` pdb
+        WHERE NOT EXISTS (
+            SELECT 1 FROM `{EMBEDDINGS_TABLE_ID}` emb 
+            WHERE emb.id = pdb.id
+        )
     """
     total_count = list(client.query(count_query).result())[0].total_count
     print(f"Found {total_count} proteins that need embeddings")
@@ -186,22 +249,32 @@ def main():
         return
     
     # Configuration
-    batch_size = 10  # Process 10 sequences at a time (good for GPU)
+    batch_size = 256  # Increased from 32 - more GPU efficient
+    upload_batch_size = 1  # Increased from 10 - fewer BigQuery jobs
     
     # Process in batches
     processed_count = 0
     successful_count = 0
     failed_count = 0
+    saved_files = []
     
     # Get all protein IDs that need embeddings
     ids_query = f"""
-        SELECT id 
-        FROM `{TABLE_ID}`
-        WHERE embeddings IS NULL
-        ORDER BY id
+        SELECT pdb.id 
+        FROM `{TABLE_ID}` pdb
+        WHERE NOT EXISTS (
+            SELECT 1 FROM `{EMBEDDINGS_TABLE_ID}` emb 
+            WHERE emb.id = pdb.id
+        )
+        ORDER BY pdb.id
     """
     
     protein_ids = [row.id for row in client.query(ids_query).result()]
+    
+    # Apply max_embeddings limit if specified
+    if max_embeddings and len(protein_ids) > max_embeddings:
+        protein_ids = protein_ids[:max_embeddings]
+        print(f"Limited to {max_embeddings} proteins for testing")
     
     print(f"Processing {len(protein_ids)} proteins in batches of {batch_size}...")
     
@@ -210,16 +283,8 @@ def main():
         batch_ids = protein_ids[i:i + batch_size]
         
         try:
-            # Check which ones already have embeddings (in case of restart)
-            existing_embeddings = check_existing_embeddings(client, batch_ids)
-            new_ids = [id_ for id_ in batch_ids if id_ not in existing_embeddings]
-            
-            if not new_ids:
-                print(f"Batch {i//batch_size + 1}: All proteins already have embeddings")
-                continue
-            
-            # Fetch sequences for this batch
-            sequences_dict = fetch_sequences_batch(client, new_ids)
+            # Fetch sequences for this batch (all IDs in batch need embeddings)
+            sequences_dict = fetch_sequences_batch(client, batch_ids)
             
             if not sequences_dict:
                 print(f"Batch {i//batch_size + 1}: No sequences found")
@@ -231,26 +296,41 @@ def main():
             
             embeddings_batch = get_protbert_embedding_batch(sequences)
             
-            # Prepare updates
-            updates = []
+            # Prepare embeddings for saving
+            embeddings_to_save = []
             for protein_id, embedding_bytes in zip(protein_ids_batch, embeddings_batch):
-                updates.append({
+                embeddings_to_save.append({
                     'id': protein_id,
                     'embeddings': embedding_bytes
                 })
             
-            # Update BigQuery
-            update_embeddings_batch(client, updates)
+            # Save embeddings to local file
+            batch_num = i // batch_size + 1
+            saved_file = save_embeddings_batch(embeddings_to_save, batch_num)
             
-            processed_count += len(new_ids)
-            successful_count += len(updates)
-            
-            print(f"Batch {i//batch_size + 1}: Processed {len(updates)} proteins")
+            if saved_file:
+                saved_files.append(saved_file)
+                processed_count += len(batch_ids)
+                successful_count += len(embeddings_to_save)
+                print(f"Batch {batch_num}: Saved {len(embeddings_to_save)} embeddings")
+                
+                # Upload files to BigQuery when we have enough
+                if len(saved_files) >= upload_batch_size:
+                    upload_files_to_bigquery(client, saved_files)
+                    saved_files = []  # Clear the list after upload
+            else:
+                failed_count += len(batch_ids)
+                print(f"Batch {batch_num}: Failed to save embeddings")
             
         except Exception as e:
             print(f"Error processing batch {i//batch_size + 1}: {e}")
             failed_count += len(batch_ids)
             continue
+    
+    # Upload any remaining files
+    if saved_files:
+        print(f"Uploading final {len(saved_files)} files...")
+        upload_files_to_bigquery(client, saved_files)
     
     print(f"\nProcessing completed!")
     print(f"Total processed: {processed_count}")
@@ -258,4 +338,8 @@ def main():
     print(f"Failed: {failed_count}")
 
 if __name__ == "__main__":
-    main() 
+    # For testing, limit to 10 embeddings
+    main(max_embeddings=251349)
+    
+    # For full run, use:
+    # main() 
