@@ -5,23 +5,23 @@ from tqdm import tqdm
 import json
 
 from siamese_inference import SiameseInference
-from siamese_dataset import SiameseProteinDataset
-
-# --- BigQuery setup ---
-from google.cloud import bigquery
-key_path = "mit-primes-464001-bfa03c2c5999.json"
-bq_client = bigquery.Client.from_service_account_json(key_path)
-ground_truth_table = "mit-primes-464001.primes_data.ground_truth_scores"
+from siamese_parquet_dataset import SiameseParquetDataset, siamese_collate_fn
 
 # --- Configuration Variables ---
-MODEL_PATH = 'siamese_transformer_best.pth'  # Path to the trained model checkpoint
+MODEL_PATH = 'siamese_transformer_parquet_best.pth'  # Path to the trained model checkpoint
 TEST_SAMPLES = 100                           # Number of test samples
 NUM_BATCHES = 3                              # Number of batches to test
+
+# GCS Configuration
+BUCKET_NAME = 'jx-compbio'
+FOLDER = 'training_data/'
+KEY_PATH = 'mit-primes-464001-bfa03c2c5999.json'
+GCS_PROJECT = 'mit-primes-464001'
 
 
 def create_test_dataset(config, test_samples=100):
     """
-    Create a test dataset with a different range of samples.
+    Create a test dataset using SiameseParquetDataset.
     
     Args:
         config: Model configuration
@@ -30,14 +30,19 @@ def create_test_dataset(config, test_samples=100):
     Returns:
         dataset: Test dataset
     """
-    dataset = SiameseProteinDataset(
-        max_samples=test_samples,
-        bq_client=bq_client,
-        ground_truth_table=ground_truth_table,
-        max_seq_len=config['max_seq_len'],
-        prottrans_dim=config['prottrans_dim'],
-        data_batch_size=config.get('data_batch_size', 32)
+    dataset = SiameseParquetDataset(
+        bucket_name=BUCKET_NAME,
+        folder=FOLDER,
+        max_len=config['max_seq_len'],
+        key_path=KEY_PATH,
+        gcs_project=GCS_PROJECT
     )
+    
+    # Limit the dataset to test_samples if needed
+    if len(dataset) > test_samples:
+        # Create a subset of the dataset
+        indices = torch.randperm(len(dataset))[:test_samples]
+        dataset = torch.utils.data.Subset(dataset, indices)
     
     return dataset
 
@@ -147,13 +152,15 @@ def test_model(model_path, test_samples=100, num_batches=3):
     test_dataset = create_test_dataset(config, test_samples)
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['batch_size'],
+        batch_size=config.get('batch_size', 32),
         shuffle=False,
+        collate_fn=lambda batch: siamese_collate_fn(batch, config['max_seq_len']),
         num_workers=0
     )
     
     print(f"\nTesting transformer model on {test_samples} samples...")
     print(f"Device: {inference.device}")
+    print(f"Dataset size: {len(test_dataset)}")
     
     all_metrics = []
     
@@ -163,10 +170,10 @@ def test_model(model_path, test_samples=100, num_batches=3):
             break
             
         # Move data to device
-        prot1_embeddings = batch['prot1_embeddings'].to(inference.device)
-        prot2_embeddings = batch['prot2_embeddings'].to(inference.device)
-        prot1_mask = batch['prot1_mask'].to(inference.device)
-        prot2_mask = batch['prot2_mask'].to(inference.device)
+        prot1_embeddings = batch['embeddings1'].to(inference.device)
+        prot2_embeddings = batch['embeddings2'].to(inference.device)
+        prot1_mask = batch['mask1'].to(inference.device)
+        prot2_mask = batch['mask2'].to(inference.device)
         tm_scores = batch['tm_score'].to(inference.device)
         lddt_scores = batch['lddt_scores'].to(inference.device)
         seqxA_list = batch['seqxA']
@@ -225,6 +232,31 @@ def test_model(model_path, test_samples=100, num_batches=3):
             'average_metrics': avg_metrics,
             'batch_metrics': all_metrics
         }
+        
+        # Save results to file
+        results_file = model_path.replace('.pth', '_test_results.json')
+        
+        # Convert numpy types to Python native types for JSON serialization
+        def convert_numpy_types(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {key: convert_numpy_types(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            else:
+                return obj
+        
+        # Convert results to JSON-serializable format
+        json_results = convert_numpy_types(results)
+        
+        with open(results_file, 'w') as f:
+            json.dump(json_results, f, indent=2)
+        print(f"Results saved to: {results_file}")
 
 
 def main():
