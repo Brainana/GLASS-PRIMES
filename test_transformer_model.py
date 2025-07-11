@@ -40,7 +40,7 @@ def create_test_dataset(config, test_samples=100):
     # Limit the dataset to test_samples if needed
     if len(dataset) > test_samples:
         # Create a subset of the dataset
-        indices = torch.randperm(len(dataset))[:test_samples]
+        indices = torch.randperm(len(dataset))[:test_samples].tolist()  # Convert to list of ints
         dataset = torch.utils.data.Subset(dataset, indices)
     
     return dataset
