@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import os
 import json
+import gcsfs
 from tqdm import tqdm
 
 from siamese_transformer_model import SiameseTransformerNet
@@ -34,11 +35,10 @@ def train_transformer_siamese_network_parquet(config=None):
     
     # Create dataset from Parquet files
     dataset = SiameseParquetDataset(
-        bucket_name=config.get('bucket_name', 'jx-compbio'),
-        folder=config.get('folder', 'training_data/'),
+        gcs_folder=config.get('gcs_folder', 'gs://jx-compbio/training_data/'),
         max_len=config.get('max_seq_len', 300),
-        key_path=config.get('key_path', 'mit-primes-464001-bfa03c2c5999.json'),
-        gcs_project=config.get('gcs_project', None)
+        gcs_project=config.get('gcs_project', None),
+        key_path=config.get('key_path', 'mit-primes-464001-bfa03c2c5999.json')
     )
     
     print(f"Dataset has {len(dataset)} samples")
@@ -47,7 +47,7 @@ def train_transformer_siamese_network_parquet(config=None):
     dataloader = DataLoader(
         dataset,
         batch_size=config.get('batch_size', 32),
-        shuffle=True,
+        shuffle=False,
         collate_fn=lambda batch: siamese_collate_fn(batch, config.get('max_seq_len', 300)),
         num_workers=config.get('num_workers', 4),
         pin_memory=True
@@ -146,9 +146,6 @@ def train_transformer_siamese_network_parquet(config=None):
                 'Batch': f'{batch_idx+1}/{len(dataloader)}'
             })
             
-            # Print per-batch loss values
-            print(f'  Batch {batch_idx+1}/{len(dataloader)}: Loss={loss.item():.4f}, Residue={loss_dict["residue_loss"].item():.4f}, Global={loss_dict["global_loss"].item():.4f}')
-        
         # Compute average losses
         avg_loss = total_loss / batches_processed
         avg_residue_loss = total_residue_loss / batches_processed
@@ -180,14 +177,16 @@ def train_transformer_siamese_network_parquet(config=None):
         # Save best model
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_loss,
-                'config': config
-            }, config['model_save_path'])
-            print(f'Best model saved with loss: {best_loss:.4f}')
+            fs = gcsfs.GCSFileSystem(project=config['gcs_project'], token=config['key_path'])
+            with fs.open('gcs://jx-compbio/models/model.pth', 'wb') as f:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': best_loss,
+                    'config': config
+                }, f)
+                print(f'Best model saved with loss: {best_loss:.4f}')
     
     return model, training_history
 
@@ -207,15 +206,13 @@ def main():
         'dropout': 0.1,             # Dropout rate
         'batch_size': 32,           # Batch size for training
         'num_workers': 4,           # Number of workers for data loading
-        'num_epochs': 16,           # Number of training epochs
+        'num_epochs': 5,           # Number of training epochs
         'learning_rate': 1e-4,      # Learning rate
         'weight_decay': 1e-5,       # Weight decay
         'max_grad_norm': 1.0,       # Gradient clipping
         'alpha': 0.7,               # Weight for per-residue loss
         'beta': 0.3,                # Weight for global loss
-        'model_save_path': 'siamese_transformer_parquet_best.pth',  # Path to save best model
-        'bucket_name': 'jx-compbio', # GCS bucket name
-        'folder': 'training_data/',  # GCS folder containing Parquet files
+        'gcs_folder': 'gs://jx-compbio/training_data/', # GCS folder containing Parquet files
         'gcs_project': 'mit-primes-464001',        # GCS project (optional)
         'key_path': 'mit-primes-464001-bfa03c2c5999.json'  # GCS service account key path (required)
     }
@@ -228,14 +225,14 @@ def main():
     
     model, history = train_transformer_siamese_network_parquet(config=config)
     
-    # Save training history
-    history_path = config['model_save_path'].replace('.pth', '_history.json')
-    with open(history_path, 'w') as f:
+    # Save training history to GCS
+    fs = gcsfs.GCSFileSystem(project=config['gcs_project'], token=config['key_path'])
+    gcs_history_path = 'gcs://jx-compbio/models/model_history.json'
+    with fs.open(gcs_history_path, 'w') as f:
         json.dump(history, f, indent=2)
     
     print("Training completed!")
-    print(f"Best model saved to: {config['model_save_path']}")
-    print(f"Training history saved to: {history_path}")
+    print(f"Training history saved to GCS: {gcs_history_path}")
 
 
 if __name__ == "__main__":

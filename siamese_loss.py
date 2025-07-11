@@ -29,6 +29,7 @@ class TMLDDTLoss(torch.nn.Module):
         total_residue_loss = 0.0
         total_global_loss = 0.0
         valid_pairs = 0
+        valid_lddt_pairs = 0
         
         for i in range(batch_size):
             tm_score = tm_scores[i].item()
@@ -46,7 +47,7 @@ class TMLDDTLoss(torch.nn.Module):
             target_sim = torch.tensor(tm_score, device=global_sim.device)
             
             # Global loss (always use TM score)
-            global_loss = torch.nn.functional.mse_loss(global_sim, target_sim)
+            global_loss = torch.nn.functional.l1_loss(global_sim, target_sim)
             
             # Per-residue loss
             if tm_score >= 0.4:
@@ -55,28 +56,26 @@ class TMLDDTLoss(torch.nn.Module):
                     new_emb1[i], new_emb2[i], lddt_scores[i], 
                     seqxA_list[i], seqM_list[i], seqyA_list[i]
                 )
+                pair_loss = self.alpha * residue_loss + self.beta * global_loss
+                total_residue_loss += residue_loss
+                valid_lddt_pairs += 1
             else:
-                # Use only TM score for global loss
-                residue_loss = self._compute_residue_loss_tm_only(
-                    global_emb1[i], global_emb2[i], tm_score
-                )
-            
-            # Combine losses
-            pair_loss = self.alpha * residue_loss + self.beta * global_loss
+                # Only global loss
+                pair_loss = global_loss
             
             total_loss += pair_loss
-            total_residue_loss += residue_loss
             total_global_loss += global_loss
+
+        avg_loss = total_loss / valid_pairs
+        avg_global_loss = total_global_loss / valid_pairs
         
-        if valid_pairs == 0:
-            return torch.tensor(0.0, device=new_emb1.device, requires_grad=True), {
+        if valid_lddt_pairs == 0:
+            return avg_global_loss, {
                 'residue_loss': torch.tensor(0.0, device=new_emb1.device),
-                'global_loss': torch.tensor(0.0, device=new_emb1.device)
+                'global_loss': avg_global_loss
             }
         
-        avg_loss = total_loss / valid_pairs
-        avg_residue_loss = total_residue_loss / valid_pairs
-        avg_global_loss = total_global_loss / valid_pairs
+        avg_residue_loss = total_residue_loss / valid_lddt_pairs
         
         return avg_loss, {
             'residue_loss': avg_residue_loss,
@@ -102,18 +101,5 @@ class TMLDDTLoss(torch.nn.Module):
         # Compute cosine similarities between aligned residues
         similarities = torch.cosine_similarity(aligned_emb1, aligned_emb2, dim=1)
         loss = torch.nn.functional.l1_loss(similarities, aligned_targets)
-        
-        return loss
-    
-    def _compute_residue_loss_tm_only(self, global_emb1, global_emb2, tm_score):
-        """Compute global loss using only TM score with global pooled embeddings."""
-        # Compute cosine similarity between global embeddings
-        global_sim = torch.cosine_similarity(global_emb1, global_emb2, dim=0)
-        
-        # Use TM score as target
-        target_score = torch.tensor(tm_score, device=global_emb1.device, dtype=torch.float32)
-        
-        # Compute L1 loss
-        loss = torch.nn.functional.l1_loss(global_sim, target_score)
         
         return loss

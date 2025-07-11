@@ -1,52 +1,54 @@
 #!/usr/bin/env python3
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, get_worker_info
 import pandas as pd
 import numpy as np
 import gcsfs
 import os
+import pyarrow.parquet as pq
 
 class SiameseParquetDataset(Dataset):
-    def __init__(self, bucket_name, folder, max_len, key_path, gcs_project=None):
+    def __init__(self, gcs_folder, max_len, gcs_project=None, key_path=None):
         """
         Args:
-            bucket_name: GCS bucket name
-            folder: GCS folder path within the bucket
+            gcs_folder: GCS folder path (e.g., 'gs://bucket/folder/')
             max_len: Maximum length to pad/truncate protein embeddings
             gcs_project: (Optional) GCP project for GCS access
-            key_path: Path to GCS service account key JSON file
+            key_path: (Optional) path to GCP service account key
         """
-        if not key_path:
-            raise ValueError("key_path is required for GCS authentication")
-        
-        if not os.path.exists(key_path):
-            raise FileNotFoundError(f"Key file not found: {key_path}")
-        
-        gcs_folder = f"gs://{bucket_name}/{folder}/"
         self.gcs_folder = gcs_folder.rstrip('/') + '/'
         self.max_len = max_len
-        self.key_path = key_path
         self.gcs_project = gcs_project
+        self.key_path = key_path
+        self.fs = None  # Will be set per worker
+        self.all_parquet_uris = None
+        self.file_row_counts = None
+        self.cumulative_rows = None
+        self.total_rows = None
+        self.current_file_idx = None
+        self.current_df = None
 
-        # Use gcsfs to enumerate all Parquet files in the folder
-        # Use service account key for authentication
-        self.fs = gcsfs.GCSFileSystem(project=gcs_project, token=key_path)
-        self.parquet_uris = [f'gs://{path}' for path in self.fs.ls(self.gcs_folder) if path.endswith('.parquet')]
-        self.parquet_uris.sort()  # Ensure consistent order
-
-        # Lazy load: just get row counts for indexing
+        # Enumerate all Parquet files in the folder (do this once in main process)
+        tempfs = gcsfs.GCSFileSystem(project=self.gcs_project, token=self.key_path)
+        self.all_parquet_uris = [f'gs://{path}' for path in tempfs.ls(self.gcs_folder) if path.endswith('.parquet')]
+        self.all_parquet_uris.sort()  # Ensure consistent order
+        
+        total = 0
         self.file_row_counts = []
         self.cumulative_rows = []
-        total = 0
-        for uri in self.parquet_uris:
-            df = pd.read_parquet(uri, columns=["tm_score"], filesystem=self.fs)
-            n = len(df)
+        for uri in self.all_parquet_uris:
+            pf = pq.ParquetFile(tempfs.open(uri))
+            n = pf.metadata.num_rows
             self.file_row_counts.append(n)
             total += n
             self.cumulative_rows.append(total)
         self.total_rows = total
-        self.current_file_idx = None
-        self.current_df = None
+        tempfs = None
+
+    def _get_fs(self):
+        if self.fs is None:
+            self.fs = gcsfs.GCSFileSystem(project=self.gcs_project, token=self.key_path)
+        return self.fs
 
     def __len__(self):
         return self.total_rows
@@ -58,32 +60,20 @@ class SiameseParquetDataset(Dataset):
                     local_idx = idx
                 else:
                     local_idx = idx - self.cumulative_rows[file_idx - 1]
-                return int(file_idx), int(local_idx)
+                return file_idx, local_idx
         raise IndexError("Index out of range")
 
     def __getitem__(self, idx):
+        fs = self._get_fs()
         file_idx, local_idx = self._find_file_and_local_idx(idx)
-        
-        # Ensure local_idx is an integer
-        local_idx = int(local_idx)
-        
-        uri = self.parquet_uris[file_idx]
+        uri = self.all_parquet_uris[file_idx]
         if self.current_file_idx != file_idx:
-            # Create a new filesystem instance for each file to avoid fork-safety issues
-            fs = gcsfs.GCSFileSystem(project=self.gcs_project, token=self.key_path)
             self.current_df = pd.read_parquet(uri, filesystem=fs)
             self.current_file_idx = file_idx
-        
-        # Debug: print indices for first few items
-        if idx < 3:
-            print(f"Item {idx}: file_idx={file_idx}, local_idx={local_idx}, df_shape={self.current_df.shape}")
-        
         row = self.current_df.iloc[local_idx]
-
         emb1 = self._to_numpy(row['embeddings1'])
         emb2 = self._to_numpy(row['embeddings2'])
         lddt_scores = self._to_numpy(row['lddt_scores'])
-
         return {
             'embeddings1': emb1,
             'embeddings2': emb2,
@@ -112,8 +102,8 @@ class SiameseParquetDataset(Dataset):
                 if seq_len > 0:
                     return arr[:seq_len * embedding_dim].reshape(seq_len, embedding_dim)
                 else:
-                    # Fallback: create a dummy 2D array with one row
-                    return arr.reshape(1, -1)
+                    # Fallback: return as 1D array
+                    return arr
         if isinstance(val, list):
             # Handle list of floats (like lddt_scores)
             return np.array(val, dtype=np.float32)
@@ -139,17 +129,12 @@ def siamese_collate_fn(batch, max_len):
         mask1s.append(m1)
         mask2s.append(m2)
         tm_scores.append(item['tm_score'])
-        
-        # Handle lddt_scores properly - pad to max_len if needed
+
         lddt = item['lddt_scores']
-        if len(lddt) < max_len:
-            # Pad with zeros if shorter than max_len
-            lddt = np.pad(lddt, (0, max_len - len(lddt)), mode='constant')
-        else:
-            # Truncate if longer than max_len
-            lddt = lddt[:max_len]
-        lddt_scores.append(lddt)
+        if lddt is None or len(lddt) < max_len:
+            lddt = np.zeros(max_len, dtype=np.float32)
         
+        lddt_scores.append(lddt)
         seqxAs.append(item['seqxA'])
         seqyAs.append(item['seqyA'])
         seqMs.append(item['seqM'])
@@ -160,7 +145,7 @@ def siamese_collate_fn(batch, max_len):
     mask1s_array = np.array(mask1s, dtype=np.float32)
     mask2s_array = np.array(mask2s, dtype=np.float32)
     lddt_scores_array = np.array(lddt_scores, dtype=np.float32)
-    
+
     return {
         'embeddings1': torch.tensor(emb1s_array, dtype=torch.float32),
         'embeddings2': torch.tensor(emb2s_array, dtype=torch.float32),
@@ -174,5 +159,5 @@ def siamese_collate_fn(batch, max_len):
     }
 
 # Example usage:
-# dataset = SiameseParquetDataset('gs://your-bucket/your-folder/', max_len=300)
-# loader = DataLoader(dataset, batch_size=32, collate_fn=lambda b: siamese_collate_fn(b, max_len=300)) 
+# dataset = SiameseParquetDataset('gs://your-bucket/your-folder/', max_len=300, gcs_project='your-gcp-project', key_path='path/to/key.json')
+# loader = DataLoader(dataset, batch_size=32, collate_fn=lambda b: siamese_collate_fn(b, max_len=300), num_workers=4) 

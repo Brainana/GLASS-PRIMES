@@ -123,8 +123,6 @@ class LDDTExtractor:
             return None
 
 
-
-
 # Initialize extractor with GPU support
 extractor = LDDTExtractor()
 

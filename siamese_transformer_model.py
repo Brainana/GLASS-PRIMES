@@ -40,7 +40,7 @@ class SiameseTransformerNet(nn.Module):
     """
     # def __init__(self, input_dim, hidden_dim=256, output_dim=128, 
     #              nhead=8, num_layers=6, dropout=0.1, max_seq_len=512):
-    // Match the TM-Vec implementation for the TM-Score twin neural network
+    # Match the TM-Vec implementation for the TM-Score twin neural network
     def __init__(self, input_dim, hidden_dim=512, output_dim=512, 
                  nhead=4, num_layers=2, dropout=0.1, max_seq_len=300):                 
         super().__init__()

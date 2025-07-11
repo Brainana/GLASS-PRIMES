@@ -8,13 +8,13 @@ from siamese_inference import SiameseInference
 from siamese_parquet_dataset import SiameseParquetDataset, siamese_collate_fn
 
 # --- Configuration Variables ---
-MODEL_PATH = 'siamese_transformer_parquet_best.pth'  # Path to the trained model checkpoint
+MODEL_PATH = 'models_model.pth'  # Path to the trained model checkpoint
 TEST_SAMPLES = 100                           # Number of test samples
 NUM_BATCHES = 3                              # Number of batches to test
 
 # GCS Configuration
 BUCKET_NAME = 'jx-compbio'
-FOLDER = 'training_data/'
+FOLDER = 'temp_folder/'
 KEY_PATH = 'mit-primes-464001-bfa03c2c5999.json'
 GCS_PROJECT = 'mit-primes-464001'
 
@@ -31,11 +31,10 @@ def create_test_dataset(config, test_samples=100):
         dataset: Test dataset
     """
     dataset = SiameseParquetDataset(
-        bucket_name=BUCKET_NAME,
-        folder=FOLDER,
+        gcs_folder=f'gs://{BUCKET_NAME}/{FOLDER}',
         max_len=config['max_seq_len'],
-        key_path=KEY_PATH,
-        gcs_project=GCS_PROJECT
+        gcs_project=GCS_PROJECT,
+        key_path=KEY_PATH
     )
     
     # Limit the dataset to test_samples if needed
