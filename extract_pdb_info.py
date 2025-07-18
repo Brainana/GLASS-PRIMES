@@ -35,20 +35,42 @@ bucket = storage_client.bucket(BUCKET_NAME)
 bq_client = bigquery.Client.from_service_account_json(key_path)
 
 
-def extract_ca_coords_and_sequence(pdb):
-    structure = parser.get_structure("protein", pdb)
-    model = next(structure.get_models())
-    chain = next(model.get_chains())
+class PDBInfoExtractor:
+    """
+    Extract Cα coordinates and sequence from PDB files.
+    """
+    def __init__(self):
+        self.parser = PDBParser(QUIET=True)
+        self.three_to_one = {
+            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+        }
     
-    ca_coords = []
-    sequence = []
-    for res in chain:
-        if 'CA' in res:
-            ca_coords.append(res['CA'].get_coord())
-            resname = res.get_resname()
-            sequence.append(three_to_one.get(resname, 'X'))  # Convert to 1-letter code
-    ca_coords = np.array(ca_coords, dtype=np.float32)
-    return ca_coords.tobytes(), "".join(sequence)
+    def extract_ca_coords_and_sequence(self, pdb_path):
+        """
+        Extract Cα coordinates and sequence from a PDB file.
+        
+        Args:
+            pdb_path: Path to the PDB file
+            
+        Returns:
+            tuple: (ca_coords, sequence) where ca_coords is numpy array and sequence is string
+        """
+        structure = self.parser.get_structure("protein", pdb_path)
+        model = next(structure.get_models())
+        chain = next(model.get_chains())
+        
+        ca_coords = []
+        sequence = []
+        for res in chain:
+            if 'CA' in res:
+                ca_coords.append(res['CA'].get_coord())
+                resname = res.get_resname()
+                sequence.append(self.three_to_one.get(resname, 'X'))  # Convert to 1-letter code
+        ca_coords = np.array(ca_coords, dtype=np.float32)
+        return ca_coords, "".join(sequence)
 
 
 def process_id(pid):
@@ -59,8 +81,8 @@ def process_id(pid):
         return None
     try:
         pdb = blob.open('r')
-        coords_bytes, sequence = extract_ca_coords_and_sequence(pdb)
-        # Base64-encode for BigQuery BYTES column via insert_rows_json
+        ca_coords, sequence = PDBInfoExtractor().extract_ca_coords_and_sequence(pdb)
+        coords_bytes = ca_coords.tobytes()
         coords_b64 = base64.b64encode(coords_bytes).decode('utf-8')
         return {
             "id": pid,

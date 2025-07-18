@@ -22,7 +22,6 @@ bucket_name = "jx-compbio"  # GCS bucket name
 bucket = storage_client.bucket(bucket_name) 
 pdb_info_table = "mit-primes-464001.primes_data.pdb_info"
 input_csv = "SWISS_MODEL/swiss_under_300_141M.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
-pdb_folder = "SWISS_MODEL/pdbs"  # GCS folder containing PDB files 
 ground_truth_table = "mit-primes-464001.primes_data.ground_truth_scores" # BigQuery table id
 batch_size = 1000  # Number of pairs to process in each batch
 num_processes = None  # Number of processes for parallel processing (None = auto)

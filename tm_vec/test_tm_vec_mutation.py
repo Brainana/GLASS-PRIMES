@@ -98,7 +98,7 @@ def main():
             # Per-residue lDDT proxy: cosine similarity at index_change +/- 5
             window = []
             for offset in range(-5, 6):
-                idx_res = index_change + offset
+                idx_res = index_change + offset - 1
                 if 0 <= idx_res < new_emb1.shape[1]:
                     sim = torch.nn.functional.cosine_similarity(
                         new_emb1[0, idx_res], new_emb2[0, idx_res], dim=0
