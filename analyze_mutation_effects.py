@@ -15,7 +15,7 @@ from pathlib import Path
 
 MODEL_NAME = "Rostlab/prot_t5_xl_uniref50"
 PAD_LEN = 300
-CSV_PATH = Path('mutations.csv')
+CSV_PATH = Path('Q8N726_info_lddt.csv')
 SIAMESE_MODEL_PATH = Path('07.10-2000.pth')  # Adjust path if needed
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,6 +80,8 @@ def analyze_mutation_effect(wild_seq, mutant_seq, model, device, true_tm_score=N
     new_emb1 = new_emb1.squeeze(0)  # [seq_len, output_dim]
     new_emb2 = new_emb2.squeeze(0)
     per_res_sim = F.cosine_similarity(new_emb1, new_emb2, dim=1).cpu().numpy()  # [seq_len]
+    # Truncate predicted scores to wild_seq length
+    per_res_sim = per_res_sim[:len(wild_seq)]
 
     # 4. Identify mutation sites and severity
     changes = []
@@ -90,13 +92,15 @@ def analyze_mutation_effect(wild_seq, mutant_seq, model, device, true_tm_score=N
     severity = [1 - sim for sim in per_res_sim]
 
     # 5. Print summary
-    print(f"Global similarity (TM-score proxy): {F.cosine_similarity(global_emb1, global_emb2, dim=1).item():.4f}")
-    print(f"Mean local similarity (lDDT proxy): {np.mean(per_res_sim):.4f}")
+    print(f"Predicted global similarity (TM-score proxy): {F.cosine_similarity(global_emb1, global_emb2, dim=1).item():.4f}")
+    print(f"Predicted mean local similarity (lDDT proxy): {np.mean(per_res_sim):.4f}")
+    if true_lddt_scores is not None:
+        print(f"True mean lDDT: {np.mean(true_lddt_scores):.4f}")
     if true_tm_score is not None:
         print(f"True TM-score: {true_tm_score:.4f}")
-    print("Mutation sites and local similarity:")
+    print("Predicted local similarity at mutation site(s):")
     for c in changes:
-        print(f"  Position {c['pos']}: {c['wt']} -> {c['mut']}, similarity: {c['sim']:.4f}, severity: {1-c['sim']:.4f}")
+        print(f"similarity: {c['sim']:.4f}")
 
     # 6. Visualization
     plt.figure(figsize=(12, 4))
@@ -107,7 +111,7 @@ def analyze_mutation_effect(wild_seq, mutant_seq, model, device, true_tm_score=N
     plt.xlabel('Residue position')
     plt.ylabel('Cosine similarity / lDDT')
     plt.title('Per-residue similarity between wild-type and mutant')
-    plt.ylim(0.9, 1)
+    plt.ylim(0.6, 1)
     plt.legend()
     plt.tight_layout()
     plt.show()
@@ -130,5 +134,8 @@ if __name__ == "__main__":
                     true_lddt_scores = lddt_list
             except Exception:
                 pass
-        print(f"\n=== Row {idx} ===")
-        analyze_mutation_effect(wild_seq, mutant_seq, model, device, true_tm_score, true_lddt_scores) 
+        description = row['description'] if 'description' in row else None
+        print(f"\n=== Row {idx} | PID: {row.get('PID', 'N/A')} ===")
+        if description:
+            print(f"Description: {description}")
+        analyze_mutation_effect(wild_seq, mutant_seq, model, device, true_tm_score, true_lddt_scores)

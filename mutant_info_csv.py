@@ -18,10 +18,6 @@ from modeller.automodel import AutoModel
 import glob
 import argparse
 
-# === Set your input and output files here ===
-input_fasta = 'P68871.fasta'
-output_csv = 'P68871_info.csv'
-
 ALPHAFOLD_URL_TEMPLATE = "https://alphafold.ebi.ac.uk/files/AF-{}-F1-model_v4.pdb"
 
 def download_alphafold_pdb(uniprot_id, out_path):
@@ -121,9 +117,9 @@ def write_pir_alignment_file(original_seq, mutant_seq, template_code, mutant_cod
         f.write(f"{mutant_seq}*\n")
 
 
-def cleanup_template_files(template_prefix="template"):
-    for ext in ["D*", "ini", "pdb", "rsr", "sch", "V*", "B*"]:
-        for f in glob.glob(f"{template_prefix}.{ext}"):
+def cleanup_files(prefix="mutant"):
+    for ext in ["D*", "ini", "pdb", "rsr", "ali", "sch", "V*", "B*"]:
+        for f in glob.glob(f"{prefix}.{ext}"):
             try:
                 os.remove(f)
             except Exception as e:
@@ -155,17 +151,19 @@ def generate_mutant_pdb(orig_pdb_path, chain_id, mutation, out_path, original_se
 
     class MyMutateModel(AutoModel):
         def select_atoms(self):
-            return Selection(self.residues[resnum + ":" + chain_id])
+            mutated = self.residues[resnum + ":" + chain_id]
+            return Selection(mutated).select_sphere(12.0)
 
-    m = MyMutateModel(env, alnfile=aln_filename, knowns="template", sequence="template")
+    m = MyMutateModel(env, alnfile=aln_filename, knowns="template", sequence="mutant")
     m.starting_model = m.ending_model = 1
     m.make()
 
     # Save the output
-    os.rename(f"template.B99990001.pdb", out_path)
+    os.rename(f"mutant.B99990001.pdb", out_path)
 
     # Clean up intermediate files
-    cleanup_template_files("template")
+    cleanup_files("mutant")
+    cleanup_files("template")
 
 
 def process_protein_from_fasta(record):
@@ -184,9 +182,11 @@ def process_protein_from_fasta(record):
         coords_bytes = coords.tobytes()
         coords_b64 = base64.b64encode(coords_bytes).decode('utf-8')
         results = []
-        for variant in variants:
+        for i, variant in enumerate(variants):
             try:
-                mutant_pdb_path = os.path.join('pdbs', f"{pid}_mutant.pdb")
+                # Create unique filename for each variant
+                variant_id = f"{variant['start']}_{variant['orig']}_{variant['var']}"
+                mutant_pdb_path = os.path.join('pdbs', f"{pid}_mutant_{variant_id}.pdb")
                 desc = variant['description']
                 import re
                 m = re.search(r'\((\w)->(\w)\)', desc)
@@ -231,8 +231,12 @@ def process_protein_from_fasta(record):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process mutant PDBs and extract coordinates.")
+    parser.add_argument('input_fasta', type=str, help='Input FASTA file with protein sequences')
     parser.add_argument('--max-rows', type=int, default=None, help='Maximum number of mutants (rows) to process (default: all)')
     args = parser.parse_args()
+    input_fasta = args.input_fasta
+    # Set output_csv to input_fasta's basename + '_info.csv'
+    output_csv = os.path.splitext(os.path.basename(input_fasta))[0] + '_info.csv'
     MAX_ROWS = args.max_rows
 
     # Read FASTA file
