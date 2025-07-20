@@ -35,23 +35,13 @@ def train_transformer_siamese_network_parquet(config=None):
     
     # Create dataset from Parquet files
     dataset = SiameseParquetDataset(
-        gcs_folder=config.get('gcs_folder', 'gs://jx-compbio/training_data/'),
+        gcs_folder=config.get('gcs_folder', 'gs://jx-compbio/testing_data/'),
         max_len=config.get('max_seq_len', 300),
         gcs_project=config.get('gcs_project', None),
         key_path=config.get('key_path', 'mit-primes-464001-bfa03c2c5999.json')
     )
     
     print(f"Dataset has {len(dataset)} samples")
-    
-    # Create DataLoader with custom collate function
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.get('batch_size', 32),
-        shuffle=False,
-        collate_fn=lambda batch: siamese_collate_fn(batch, config.get('max_seq_len', 300)),
-        num_workers=config.get('num_workers', 4),
-        pin_memory=True
-    )
     
     # Create model
     model = SiameseTransformerNet(
@@ -69,7 +59,8 @@ def train_transformer_siamese_network_parquet(config=None):
     # Create custom loss function
     criterion = TMLDDTLoss(
         alpha=config['alpha'],
-        beta=config['beta']
+        beta=config['beta'],
+        gamma=config['gamma']
     ).to(device)
     
     # Create optimizer
@@ -81,7 +72,7 @@ def train_transformer_siamese_network_parquet(config=None):
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        optimizer, mode='min', factor=0.5, patience=5
     )
     
     # Training loop
@@ -89,9 +80,22 @@ def train_transformer_siamese_network_parquet(config=None):
     training_history = []
     
     for epoch in range(config['num_epochs']):
+        # reshuffle Dataset cache at the start of each epoch
+        dataset._build_shuffled_index_cache()
+        # re-create DataLoader for the new shuffled data
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config.get('batch_size', 32),
+            shuffle=False,
+            collate_fn=lambda batch: siamese_collate_fn(batch, config.get('max_seq_len', 300)),
+            num_workers=config.get('num_workers', 4),
+            pin_memory=True
+        )
+
         model.train()
         total_loss = 0.0
         total_residue_loss = 0.0
+        total_weighted_loss = 0.0
         total_global_loss = 0.0
         batches_processed = 0
         
@@ -136,12 +140,14 @@ def train_transformer_siamese_network_parquet(config=None):
             # Update metrics
             total_loss += loss.item()
             total_residue_loss += loss_dict['residue_loss'].item()
+            total_weighted_loss += loss_dict['weighted_loss'].item()
             total_global_loss += loss_dict['global_loss'].item()
             
             # Update progress bar
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'Residue': f'{loss_dict["residue_loss"].item():.4f}',
+                'Weighted Residue': f'{loss_dict["weighted_loss"].item():.4f}',
                 'Global': f'{loss_dict["global_loss"].item():.4f}',
                 'Batch': f'{batch_idx+1}/{len(dataloader)}'
             })
@@ -149,6 +155,7 @@ def train_transformer_siamese_network_parquet(config=None):
         # Compute average losses
         avg_loss = total_loss / batches_processed
         avg_residue_loss = total_residue_loss / batches_processed
+        avg_weighted_loss = total_weighted_loss / batches_processed
         avg_global_loss = total_global_loss / batches_processed
         
         # Update learning rate
@@ -159,6 +166,7 @@ def train_transformer_siamese_network_parquet(config=None):
             'epoch': epoch + 1,
             'avg_loss': avg_loss,
             'avg_residue_loss': avg_residue_loss,
+            'avg_weighted_loss': avg_weighted_loss,
             'avg_global_loss': avg_global_loss,
             'learning_rate': optimizer.param_groups[0]['lr'],
             'batches_processed': batches_processed
@@ -169,8 +177,8 @@ def train_transformer_siamese_network_parquet(config=None):
         print(f'Epoch {epoch+1}/{config["num_epochs"]}:')
         print(f'  Average Loss: {avg_loss:.4f}')
         print(f'  Residue Loss: {avg_residue_loss:.4f}')
+        print(f'  Weighted Residue Loss: {avg_weighted_loss:.4f}')
         print(f'  Global Loss: {avg_global_loss:.4f}')
-        print(f'  Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
         print(f'  Batches Processed: {batches_processed}')
         print()
         
@@ -199,20 +207,21 @@ def main():
     config = {
         'prottrans_dim': 1024,      # Dimension of ProtTrans embeddings
         'max_seq_len': 300,         # Maximum sequence length for padding
-        'hidden_dim': 512,          # Hidden dimension of the transformer
+        'hidden_dim': 1024,         # Hidden dimension of the transformer
         'output_dim': 512,          # Output dimension of new embeddings
         'nhead': 4,                 # Number of attention heads
         'num_layers': 2,            # Number of transformer layers
         'dropout': 0.1,             # Dropout rate
-        'batch_size': 32,           # Batch size for training
+        'batch_size': 16,           # Batch size for training
         'num_workers': 4,           # Number of workers for data loading
-        'num_epochs': 5,           # Number of training epochs
+        'num_epochs': 5,            # Number of training epochs
         'learning_rate': 1e-4,      # Learning rate
         'weight_decay': 1e-5,       # Weight decay
         'max_grad_norm': 1.0,       # Gradient clipping
         'alpha': 0.7,               # Weight for per-residue loss
         'beta': 0.3,                # Weight for global loss
-        'gcs_folder': 'gs://jx-compbio/training_data/', # GCS folder containing Parquet files
+        'gamma': 0.1,               # Weight for weighted per-residue loss
+        'gcs_folder': 'gs://jx-compbio/testing_data/', # GCS folder containing Parquet files
         'gcs_project': 'mit-primes-464001',        # GCS project (optional)
         'key_path': 'mit-primes-464001-bfa03c2c5999.json'  # GCS service account key path (required)
     }

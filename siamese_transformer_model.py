@@ -16,7 +16,7 @@ class TransformerEncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.activation = nn.ReLU()
+        self.activation = nn.GELU()
     
     def forward(self, src, src_key_padding_mask=None):
         # Self-attention
@@ -38,10 +38,7 @@ class SiameseTransformerNet(nn.Module):
     Uses self-attention to capture sequence dependencies and local structure patterns.
     Relies on ProtTrans embeddings' inherent positional information.
     """
-    # def __init__(self, input_dim, hidden_dim=256, output_dim=128, 
-    #              nhead=8, num_layers=6, dropout=0.1, max_seq_len=512):
-    # Match the TM-Vec implementation for the TM-Score twin neural network
-    def __init__(self, input_dim, hidden_dim=512, output_dim=512, 
+    def __init__(self, input_dim, hidden_dim=1024, output_dim=512, 
                  nhead=4, num_layers=2, dropout=0.1, max_seq_len=300):                 
         super().__init__()
         self.input_dim = input_dim
@@ -49,22 +46,29 @@ class SiameseTransformerNet(nn.Module):
         self.output_dim = output_dim
         self.max_seq_len = max_seq_len
         
-        # Input projection
-        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        # Input projection block: linear + LayerNorm + Dropout
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout)
+        )
         
         # Transformer encoder layers
         self.transformer_layers = nn.ModuleList([
-            TransformerEncoderLayer(hidden_dim, nhead, hidden_dim * 4, dropout)
+            TransformerEncoderLayer(hidden_dim, nhead, hidden_dim * 2, dropout)
             for _ in range(num_layers)
         ])
         
-        # Output projection
-        self.output_projection = nn.Linear(hidden_dim, output_dim)
+        # Output projection block: linear + GELU
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.GELU()
+        )
         
-        # Attention pooling for global embedding
+        # Attention pooling for global embedding (last linear outputs 1)
         self.global_attention = nn.Sequential(
             nn.Linear(output_dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim // 2, 1)
         )
         
@@ -75,10 +79,25 @@ class SiameseTransformerNet(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize transformer weights."""
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        """Enhanced weight initialization for better training."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Use Xavier initialization for linear layers
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                # Initialize layer norm
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.MultiheadAttention):
+                # Initialize attention weights
+                nn.init.xavier_uniform_(module.in_proj_weight)
+                nn.init.xavier_uniform_(module.out_proj.weight)
+                if module.in_proj_bias is not None:
+                    nn.init.zeros_(module.in_proj_bias)
+                if module.out_proj.bias is not None:
+                    nn.init.zeros_(module.out_proj.bias)
     
     def forward(self, x1, x2, mask1=None, mask2=None):
         """
@@ -118,14 +137,14 @@ class SiameseTransformerNet(nn.Module):
             new_emb: Per-residue embeddings [batch_size, seq_len, output_dim]
             global_emb: Global embedding [batch_size, output_dim]
         """
-        # Input projection
+        # Input block: projection + LayerNorm + Dropout
         x = self.input_projection(x)  # [batch_size, seq_len, hidden_dim]
         
         # Apply transformer layers (no positional encoding needed)
         for layer in self.transformer_layers:
             x = layer(x, src_key_padding_mask=(mask == 0) if mask is not None else None)
         
-        # Output projection
+        # Output projection block: projection + GELU + LayerNorm + Dropout
         new_emb = self.output_projection(x)  # [batch_size, seq_len, output_dim]
         
         # Global embedding with attention pooling
