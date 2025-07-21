@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import gcsfs
 import os
+import random
 import pyarrow.parquet as pq
 
 class SiameseParquetDataset(Dataset):
@@ -22,6 +23,7 @@ class SiameseParquetDataset(Dataset):
         self.key_path = key_path
         self.fs = None  # Will be set per worker
         self.all_parquet_uris = None
+        self.uri_to_row_count = {} 
         self.file_row_counts = None
         self.cumulative_rows = None
         self.total_rows = None
@@ -31,19 +33,31 @@ class SiameseParquetDataset(Dataset):
         # Enumerate all Parquet files in the folder (do this once in main process)
         tempfs = gcsfs.GCSFileSystem(project=self.gcs_project, token=self.key_path)
         self.all_parquet_uris = [f'gs://{path}' for path in tempfs.ls(self.gcs_folder) if path.endswith('.parquet')]
-        self.all_parquet_uris.sort()  # Ensure consistent order
-        
-        total = 0
+
+        self.all_parquet_uris = self.all_parquet_uris[:5]
+
+        for uri in self.all_parquet_uris:
+            with tempfs.open(uri) as f:
+                pf = pq.ParquetFile(f)
+                n = pf.metadata.num_rows
+                self.uri_to_row_count[uri] = n
+        tempfs = None
+
+        self._build_shuffled_index_cache()
+
+    def _build_shuffled_index_cache(self):
+        # Shuffle the URIs
+        random.shuffle(self.all_parquet_uris)
+        # Build file_row_counts and cumulative_rows based on shuffled uris
         self.file_row_counts = []
         self.cumulative_rows = []
+        total = 0
         for uri in self.all_parquet_uris:
-            pf = pq.ParquetFile(tempfs.open(uri))
-            n = pf.metadata.num_rows
+            n = self.uri_to_row_count[uri]
             self.file_row_counts.append(n)
             total += n
             self.cumulative_rows.append(total)
         self.total_rows = total
-        tempfs = None
 
     def _get_fs(self):
         if self.fs is None:
