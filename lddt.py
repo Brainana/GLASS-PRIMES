@@ -15,7 +15,7 @@ class LDDTCalculator:
     """
     
     def __init__(self, distance_thresholds: List[float] = None, 
-                 max_distance: float = 15.0):
+                 max_distance: float = 30.0):
         """
         Initialize lDDT calculator.
         
