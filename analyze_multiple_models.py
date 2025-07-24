@@ -17,7 +17,7 @@ from pathlib import Path
 
 MODEL_NAME = "Rostlab/prot_t5_xl_uniref50"
 PAD_LEN = 300
-CSV_PATH = Path('Q8N726_info_lddt_100.csv')
+CSV_PATH = Path('Q8N726_info_lddt.csv')
 # List of model checkpoint paths to compare
 SIAMESE_MODEL_PATHS = [
     Path('07.10-2000.pth'),
@@ -129,19 +129,40 @@ def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labe
         print(f"True TM-score: {true_tm_score:.4f}")
 
     # 4. Visualization
-    plt.figure(figsize=(12, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 4))
+    
+    # Original plot
     for per_res_sim, label in zip(all_per_res_sim, model_labels):
-        plt.plot(per_res_sim, label=f'Predicted ({label})')
+        ax1.plot(per_res_sim, label=f'Predicted ({label})')
     if changes:
         for c in changes:
-            plt.axvline(c['pos'], color='red', linestyle='--', alpha=0.3)
+            ax1.axvline(c['pos'], color='red', linestyle='--', alpha=0.3)
     if true_lddt_scores is not None:
-        plt.plot(true_lddt_scores, label='True lDDT scores', color='green', alpha=0.7)
-    plt.xlabel('Residue position')
-    plt.ylabel('Cosine similarity / lDDT')
-    plt.title('Per-residue similarity between wild-type and mutant')
-    plt.ylim(0.6, 1)
-    plt.legend()
+        ax1.plot(true_lddt_scores, label='True lDDT scores', color='green', alpha=0.7)
+    ax1.set_xlabel('Residue position')
+    ax1.set_ylabel('Cosine similarity / lDDT')
+    ax1.set_title('Per-residue similarity between wild-type and mutant')
+    ax1.set_ylim(0.6, 1)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Difference plot
+    if true_lddt_scores is not None:
+        for per_res_sim, label in zip(all_per_res_sim, model_labels):
+            min_len = min(len(per_res_sim), len(true_lddt_scores))
+            differences = per_res_sim[:min_len] - true_lddt_scores[:min_len]
+            ax2.plot(differences, label=f'{label} - True lDDT')
+        ax2.axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Zero difference')
+        if changes:
+            for c in changes:
+                if c['pos'] < min_len:
+                    ax2.axvline(c['pos'], color='red', linestyle='--', alpha=0.3)
+        ax2.set_xlabel('Residue position')
+        ax2.set_ylabel('Difference (Predicted - True lDDT)')
+        ax2.set_title('Difference between predicted and true lDDT scores')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
     plt.tight_layout()
     plt.show()
 
