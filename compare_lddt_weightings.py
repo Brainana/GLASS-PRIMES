@@ -30,7 +30,9 @@ def compare_weighting_schemes(csv_path):
         'Equal (exp=0.0)': 0.0,
         'Linear (exp=1.0)': 1.0,
         'Squared (exp=2.0)': 2.0,
-        'Cubic (exp=3.0)': 3.0
+        'Cubic (exp=3.0)': 3.0,
+        'Quartic (exp=4.0)': 4.0,
+        'Quintic (exp=5.0)': 5.0
     }
     
     # Store results for each protein
@@ -50,6 +52,9 @@ def compare_weighting_schemes(csv_path):
             pid = row.get('PID', f'protein_{idx}')
             description = row.get('description', '')
             
+            # Find mutation site
+            mutation_site = row['mutation_start']
+            
             print(f"Processing {pid}: {description}")
             
             # Calculate lDDT scores for each weighting scheme
@@ -57,19 +62,22 @@ def compare_weighting_schemes(csv_path):
             
             for scheme_name, weight_exp in weighting_schemes.items():
                 calculator = LDDTCalculatorWeighted(weight_exponent=weight_exp)
-                lddt_scores = calculator.calculate_lddt(mutant_coords, coords)
+                lddt_scores = calculator.calculate_lddt(coords, mutant_coords)
                 protein_results[scheme_name] = lddt_scores
                 print(f"  {scheme_name}: scores[0:5] = {lddt_scores[:5]}")
             
             all_results[pid] = {
                 'description': description,
                 'scores': protein_results,
-                'sequence_length': len(coords)
+                'sequence_length': len(coords),
+                'mutation_site': mutation_site
             }
             
         except Exception as e:
             print(f"Error processing {row.get('PID', idx)}: {e}")
             continue
+
+        break
     
     # Create comparison plots
     create_weighting_comparison_plots(all_results)
@@ -86,29 +94,32 @@ def create_weighting_comparison_plots(all_results):
     fig, ax = plt.subplots(1, 1, figsize=(12, 8))
     fig.suptitle('lDDT Score Comparison: Different Distance Weighting Schemes', fontsize=16)
     
-    # Plot separate plot for each protein
-    colors = ['blue', 'red', 'green', 'orange']
+    # Plot all schemes for one protein
+    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown']
     
-    for pid, data in all_results.items():
-        # Create a new figure for each protein
-        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-        
-        seq_len = data['sequence_length']
-        positions = np.arange(seq_len)
-        
-        for i, scheme in enumerate(schemes):
-            scores = data['scores'][scheme]
-            ax.plot(positions, scores, label=scheme, 
-                   color=colors[i], alpha=0.8, linewidth=2)
-        
-        ax.set_xlabel('Residue Position')
-        ax.set_ylabel('lDDT Score')
-        ax.set_title(f'{pid}: {data["description"]}')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.show()
+    # Get the first (and only) protein
+    pid, data = list(all_results.items())[0]
+    seq_len = data['sequence_length']
+    positions = np.arange(seq_len)
+    
+    for i, scheme in enumerate(schemes):
+        scores = data['scores'][scheme]
+        ax.plot(positions, scores, label=scheme, 
+               color=colors[i], alpha=0.8, linewidth=2)
+    
+    # Add mutation site line if available
+    if data.get('mutation_site') is not None:
+        ax.axvline(x=data['mutation_site'], color='red', linestyle='--', alpha=0.7, 
+                   label=f'Mutation site ({data["mutation_site"]})')
+    
+    ax.set_xlabel('Residue Position')
+    ax.set_ylabel('lDDT Score')
+    ax.set_title(f'{pid}: {data["description"]}')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
     
     # 3. Summary statistics
     summary_stats = {}
