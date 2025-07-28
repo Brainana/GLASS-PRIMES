@@ -1,5 +1,6 @@
 import numpy as np
 from typing import List, Tuple, Optional
+from scipy.spatial.distance import cdist
 
 class LDDTCalculator:
     """
@@ -15,7 +16,7 @@ class LDDTCalculator:
     """
     
     def __init__(self, distance_thresholds: List[float] = None, 
-                 max_distance: float = 30.0):
+                 max_distance: float = 15.0):
         """
         Initialize lDDT calculator.
         
@@ -32,82 +33,71 @@ class LDDTCalculator:
         self.max_distance = max_distance
         self.num_thresholds = len(self.distance_thresholds)
     
-    def calculate_lddt(self, model_coords: np.ndarray, reference_coords: np.ndarray) -> np.ndarray:
+    def calculate_lddt(self, reference_coords: np.ndarray, model_coords: np.ndarray) -> np.ndarray:
         """
         Calculate lDDT score for a protein model against reference structure.
-        Assumes model_coords and reference_coords are in one-to-one correspondence.
+        Assumes reference_coords and model_coords are in one-to-one correspondence.
         
         Args:
-            model_coords: Cα coordinates of model [N, 3]
             reference_coords: Cα coordinates of reference [N, 3]
+            model_coords: Cα coordinates of model [N, 3]
         
         Returns:
             per_residue_scores: lDDT scores for each residue [N]
         """
-        if model_coords.shape != reference_coords.shape:
-            raise ValueError("Model and reference coordinates must have the same shape for one-to-one correspondence.")
-        N = model_coords.shape[0]
+        if reference_coords.shape != model_coords.shape:
+            raise ValueError("Reference and model coordinates must have the same shape for one-to-one correspondence.")
+        N = reference_coords.shape[0]
         # Calculate distance matrices for all residues
-        model_distances = self._calculate_distance_matrix(model_coords)
         reference_distances = self._calculate_distance_matrix(reference_coords)
+        model_distances = self._calculate_distance_matrix(model_coords)
         # Calculate lDDT scores for each residue
         per_residue_scores = np.zeros(N)
         for i in range(N):
             per_residue_scores[i] = self._calculate_residue_lddt(
-                i, model_distances, reference_distances
+                i, reference_distances, model_distances
             )
         return per_residue_scores
 
     def _calculate_distance_matrix(self, coords: np.ndarray) -> np.ndarray:
         """
-        Calculate pairwise distance matrix for Cα atoms.
-        
+        Calculate pairwise distance matrix for Cα atoms using scipy's cdist.
         Args:
             coords: Cα coordinates [N, 3]
-        
         Returns:
             Distance matrix [N, N]
         """
-        N = coords.shape[0]
-        distances = np.zeros((N, N))
-        
-        # Calculate pairwise distances
-        for i in range(N):
-            for j in range(N):
-                if i != j:
-                    dist = np.linalg.norm(coords[i] - coords[j])
-                    distances[i, j] = dist
-        
+        distances = cdist(coords, coords, metric='euclidean')
         return distances
     
     def _calculate_residue_lddt(self, residue_idx: int, 
-                               model_distances: np.ndarray,
-                               reference_distances: np.ndarray) -> float:
+                               reference_distances: np.ndarray,
+                               model_distances: np.ndarray) -> float:
         """
         Calculate lDDT score for a single residue.
         
         Args:
             residue_idx: Index of the residue to score
-            model_distances: Distance matrix for model [N, N]
             reference_distances: Distance matrix for reference [N, N]
+            model_distances: Distance matrix for model [N, N]
         
         Returns:
             lDDT score for the residue (0-1)
         """
-        ref_distances = reference_distances[residue_idx]
-        neighbors = np.where((ref_distances > 0) & 
-                           (ref_distances <= self.max_distance))[0]
+        ref_distances_residue = reference_distances[residue_idx]
+        neighbors = np.where((ref_distances_residue > 0) & 
+                           (ref_distances_residue <= self.max_distance))[0]
         
         if len(neighbors) == 0:
             return 0  # No neighbors to compare
-        
+
         # Calculate distance differences
         distance_diffs = []
         for neighbor in neighbors:
             model_dist = model_distances[residue_idx, neighbor]
             ref_dist = reference_distances[residue_idx, neighbor]
             
-            if model_dist > 0:  # Valid distance in model
+            if ref_dist > 0:  # Valid distance in reference
                 diff = abs(model_dist - ref_dist)
                 distance_diffs.append(diff)
         
