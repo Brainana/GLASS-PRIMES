@@ -14,28 +14,29 @@ from transformers import T5EncoderModel, T5Tokenizer
 from siamese_transformer_model import SiameseTransformerNet
 from siamese_transformer_model_v1 import SiameseTransformerNetV1
 from pathlib import Path
+import re
 
 MODEL_NAME = "Rostlab/prot_t5_xl_uniref50"
 PAD_LEN = 300
 CSV_PATH = Path('Q8N726_info_lddt.csv')
 # List of model checkpoint paths to compare
 SIAMESE_MODEL_PATHS = [
-    Path('07.10-2000.pth'),
+    # Path('07.27-2000parquet.pth'),
     # Add more model paths here
-    Path('07.20-2000parquet.pth'),
+    Path('07.26-2000parquet.pth'),
     # Path('07.12-4000.pth'),
 ]
 
 MODEL_LABELS = [
-    'Model 1',
+    # 'Model 1',
     # Add more labels corresponding to the models above
     'Model 2',
     # 'Model 3',
 ]
 model_versions = [
-    'v1',  # 'v1' for old checkpoints, 'v2' for new
+    # 'v2',  # 'v1' for old checkpoints, 'v2' for new
     # Add more versions corresponding to the models above
-    'v2'
+    'v2',
 ]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,10 +101,12 @@ def get_per_residue_similarity(wild_seq, mutant_seq, model, config, device):
     new_emb1 = new_emb1.squeeze(0)  # [seq_len, output_dim]
     new_emb2 = new_emb2.squeeze(0)
     per_res_sim = F.cosine_similarity(new_emb1, new_emb2, dim=1).cpu().numpy()  # [seq_len]
+    # Normalize cosine similarities from [-1, 1] to [0, 1] range to match training
+    per_res_sim = (per_res_sim + 1) / 2
     per_res_sim = per_res_sim[:len(wild_seq)]
     return per_res_sim
 
-def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labels, device, true_tm_score=None, true_lddt_scores=None):
+def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labels, device, true_tm_score=None, true_lddt_scores=None, pid=None, description=None):
     # 1. Get per-residue predictions for each model
     all_per_res_sim = []
     for model, config in models_and_configs:
@@ -123,6 +126,13 @@ def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labe
         print(f"  Predicted local similarity at mutation site(s):")
         for c in changes:
             print(f"    Pos {c['pos']} {c['wt']}->{c['mut']}: {per_res_sim[c['pos']]:.4f}")
+        
+        # Calculate average absolute error if true lDDT scores are available
+        if true_lddt_scores is not None:
+            min_len = min(len(per_res_sim), len(true_lddt_scores))
+            mae = np.mean(np.abs(per_res_sim[:min_len] - true_lddt_scores[:min_len]))
+            print(f"  Average Absolute Error (MAE): {mae:.4f}")
+    
     if true_lddt_scores is not None:
         print(f"True mean lDDT: {np.mean(true_lddt_scores):.4f}")
     if true_tm_score is not None:
@@ -130,7 +140,7 @@ def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labe
 
     # 4. Visualization
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 4))
-    
+
     # Original plot
     for per_res_sim, label in zip(all_per_res_sim, model_labels):
         ax1.plot(per_res_sim, label=f'Predicted ({label})')
@@ -139,13 +149,27 @@ def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labe
             ax1.axvline(c['pos'], color='red', linestyle='--', alpha=0.3)
     if true_lddt_scores is not None:
         ax1.plot(true_lddt_scores, label='True lDDT scores', color='green', alpha=0.7)
+    # Create title with PID and description if available
+    title_parts = []
+    if pid and pid != 'N/A':
+        title_parts.append(pid)
+    if description:
+        # Extract just the mutation part (e.g., "x:x (P->S)") from the description
+        mutation_match = re.search(r'(\d+:\d+\s*\([A-Z]->[A-Z]\))', description)
+        if mutation_match:
+            title_parts.append(mutation_match.group(1))
+        else:
+            title_parts.append(description)
+    title_suffix = f" - {' | '.join(title_parts)}" if title_parts else ""
+
     ax1.set_xlabel('Residue position')
-    ax1.set_ylabel('Cosine similarity / lDDT')
-    ax1.set_title('Per-residue similarity between wild-type and mutant')
-    ax1.set_ylim(0.6, 1)
+    ax1.set_ylabel('Normalized cosine similarity / lDDT')
+    ax1.set_title(f'Per-residue similarity between wild-type and mutant{title_suffix}')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    
+    # Set y-axis limits for normalized cosine similarity (0 to 1)
+    ax1.set_ylim(0.75, 1)
+
     # Difference plot
     if true_lddt_scores is not None:
         for per_res_sim, label in zip(all_per_res_sim, model_labels):
@@ -159,12 +183,30 @@ def analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, model_labe
                     ax2.axvline(c['pos'], color='red', linestyle='--', alpha=0.3)
         ax2.set_xlabel('Residue position')
         ax2.set_ylabel('Difference (Predicted - True lDDT)')
-        ax2.set_title('Difference between predicted and true lDDT scores')
+        ax2.set_title(f'Difference between predicted and true lDDT scores{title_suffix}')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.show()
+    
+    # Print summary of all models' performance
+    if true_lddt_scores is not None:
+        print(f"\n=== Model Performance Summary ===")
+        for label, per_res_sim in zip(model_labels, all_per_res_sim):
+            min_len = min(len(per_res_sim), len(true_lddt_scores))
+            mae = np.mean(np.abs(per_res_sim[:min_len] - true_lddt_scores[:min_len]))
+            print(f"{label}: MAE = {mae:.4f}")
+        
+        # Find best performing model
+        mae_scores = []
+        for per_res_sim in all_per_res_sim:
+            min_len = min(len(per_res_sim), len(true_lddt_scores))
+            mae = np.mean(np.abs(per_res_sim[:min_len] - true_lddt_scores[:min_len]))
+            mae_scores.append(mae)
+        
+        best_model_idx = np.argmin(mae_scores)
+        print(f"Best performing model: {model_labels[best_model_idx]} (MAE = {mae_scores[best_model_idx]:.4f})")
 
 if __name__ == "__main__":
     df = pd.read_csv(CSV_PATH)
@@ -187,7 +229,8 @@ if __name__ == "__main__":
             except Exception:
                 pass
         description = row['description'] if 'description' in row else None
-        print(f"\n=== Row {idx} | PID: {row.get('PID', 'N/A')} ===")
+        pid = row.get('PID', 'N/A')
+        print(f"\n=== Row {idx} | PID: {pid} ===")
         if description:
             print(f"Description: {description}")
-        analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, MODEL_LABELS, device, true_tm_score, true_lddt_scores)
+        analyze_mutation_effect(wild_seq, mutant_seq, models_and_configs, MODEL_LABELS, device, true_tm_score, true_lddt_scores, pid, description)

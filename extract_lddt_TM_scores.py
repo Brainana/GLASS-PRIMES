@@ -8,39 +8,29 @@ from typing import List, Dict, Tuple, Optional
 from google.cloud import storage
 from Bio.PDB import PDBParser
 from tmtools import tm_align
-from lddt import LDDTCalculator
+from lddt_weighted import LDDTCalculatorWeighted
 from google.cloud import bigquery
 import time
 from alignment_utils import parse_alignment_from_sequences
 
-start_line = 1000000  # Line to start from
+start_line = 0  # Line to start from
 max_pairs = 1000000  # Maximum number of pairs to process from CSV (None for all)
 key_path = "mit-primes-464001-bfa03c2c5999.json"
 client = bigquery.Client.from_service_account_json(key_path) 
 storage_client = storage.Client.from_service_account_json(key_path) 
-bucket_name = "jx-compbio"  # GCS bucket name
+bucket_name = "primes-bucket"  # GCS bucket name
 bucket = storage_client.bucket(bucket_name) 
-pdb_info_table = "mit-primes-464001.primes_data.pdb_info"
+pdb_info_table = "mit-primes-464001.primes_compbio.proteins"
 input_csv = "SWISS_MODEL/swiss_under_300_141M.csv"  # Input CSV file with protein pairs (only needs chain_1, chain_2 columns)
-ground_truth_table = "mit-primes-464001.primes_data.ground_truth_scores" # BigQuery table id
+ground_truth_table = "mit-primes-464001.primes_compbio.ground_truth_scores_weightedexpo5" # BigQuery table id
 batch_size = 1000  # Number of pairs to process in each batch
 num_processes = None  # Number of processes for parallel processing (None = auto)
 progress_file = "progress.txt"  # File to store last processed line
 
 
-# Try to import PyTorch for GPU acceleration
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
 class LDDTExtractor:
     """
     Extract LDDT scores for protein pairs using provided alignments.
-    UPDATED: Accepts seqxA, seqyA, and seqM as direct inputs.
-    UPDATED: Accepts GCS file paths directly instead of protein IDs.
-    CORRECTED: Implements proper LDDT algorithm with 15Å cutoff and distance difference thresholds.
     """
     
     def __init__(self):
@@ -56,7 +46,7 @@ class LDDTExtractor:
         self.max_cache_size = 100  # Limit cache size to prevent memory issues
         
         # Initialize lDDT calculator
-        self.lddt_calculator = LDDTCalculator()
+        self.lddt_calculator = LDDTCalculatorWeighted(weight_exponent=5.0)
     
     def read_from_gcs(self, gcs_path: str) -> str:
         """
@@ -101,7 +91,7 @@ class LDDTExtractor:
             # Calculate lDDT per-residue scores if TM_score >= 0.4
             lddt_scores_padded = np.zeros(0, dtype=float)
             if tm_score >= 0.4:
-                per_residue_scores = self.lddt_calculator.calculate_lddt(model_coords, reference_coords)
+                per_residue_scores = self.lddt_calculator.calculate_lddt(reference_coords, model_coords)
                 # Pad lDDT scores to length 300, placing each score at the correct model index
                 lddt_scores_padded = np.zeros(300, dtype=float)
                 for score_idx, (model_idx, _) in enumerate(alignment_pairs):
