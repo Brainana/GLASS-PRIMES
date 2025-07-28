@@ -34,8 +34,6 @@ class SiameseParquetDataset(Dataset):
         tempfs = gcsfs.GCSFileSystem(project=self.gcs_project, token=self.key_path)
         self.all_parquet_uris = [f'gs://{path}' for path in tempfs.ls(self.gcs_folder) if path.endswith('.parquet')]
 
-        self.all_parquet_uris = self.all_parquet_uris[:5]
-
         for uri in self.all_parquet_uris:
             with tempfs.open(uri) as f:
                 pf = pq.ParquetFile(f)
