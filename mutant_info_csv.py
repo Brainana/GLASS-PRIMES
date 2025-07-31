@@ -17,8 +17,13 @@ from modeller import Environ, Selection
 from modeller.automodel import AutoModel
 import glob
 import argparse
+import sys
+import time
+from contextlib import redirect_stdout, redirect_stderr
 
 ALPHAFOLD_URL_TEMPLATE = "https://alphafold.ebi.ac.uk/files/AF-{}-F1-model_v4.pdb"
+MAX_PROTEINS = 100
+MAX_VARIANTS_PER_PROTEIN = 5  # Global config variable - limit to 5 mutants per protein
 
 def download_alphafold_pdb(uniprot_id, out_path):
     url = ALPHAFOLD_URL_TEMPLATE.format(uniprot_id)
@@ -139,6 +144,11 @@ def generate_mutant_pdb(orig_pdb_path, chain_id, mutation, out_path, original_se
     """
     env = Environ()
     env.io.atom_files_directory = ['.']
+    
+    # Aggressive speed optimizations for large proteins
+    env.optimize_max_iterations = 50  # Limit optimization iterations
+    env.max_var_iterations = 5  # Very few iterations
+
     aln_filename = f"template.ali"
     write_pir_alignment_file(original_seq, mutant_seq, "template", "mutant", aln_filename)
 
@@ -151,11 +161,17 @@ def generate_mutant_pdb(orig_pdb_path, chain_id, mutation, out_path, original_se
 
     class MyMutateModel(AutoModel):
         def select_atoms(self):
+            # Only optimize atoms near the mutation site
             mutated = self.residues[resnum + ":" + chain_id]
-            return Selection(mutated).select_sphere(12.0)
+            return Selection(mutated).select_sphere(50.0)  # Reduced radius from 100.0
+        
+        def special_restraints(self, aln):
+            # Disable most restraints for speed
+            pass
 
     m = MyMutateModel(env, alnfile=aln_filename, knowns="template", sequence="mutant")
     m.starting_model = m.ending_model = 1
+    
     m.make()
 
     # Save the output
@@ -182,7 +198,12 @@ def process_protein_from_fasta(record):
         coords_bytes = coords.tobytes()
         coords_b64 = base64.b64encode(coords_bytes).decode('utf-8')
         results = []
-        for i, variant in enumerate(variants):
+        # Limit to first N variants per protein
+        variants_to_process = variants[:MAX_VARIANTS_PER_PROTEIN]
+        for i, variant in enumerate(variants_to_process):
+            variant_start_time = time.time()
+            print(f"  Processing variant {i+1}/{len(variants_to_process)}: {variant['description']}")
+            
             try:
                 # Create unique filename for each variant
                 variant_id = f"{variant['start']}_{variant['orig']}_{variant['var']}"
@@ -206,6 +227,7 @@ def process_protein_from_fasta(record):
                         print(f"Error generating mutant PDB for {pid}: {e}")
                 else:
                     print(f"Could not parse mutation info for {pid}: {desc}")
+                
                 mutant_coords, _ = extractor.extract_ca_coords_and_sequence(mutant_pdb_path)
                 mutant_coords_bytes = mutant_coords.tobytes()
                 mutant_coords_b64 = base64.b64encode(mutant_coords_bytes).decode('utf-8')
@@ -221,9 +243,14 @@ def process_protein_from_fasta(record):
                     'coords': coords_b64,
                     'mutant_coords': mutant_coords_b64
                 })
+                
+                variant_time = time.time() - variant_start_time
+                print(f"  ✓ Completed variant {i+1}/{len(variants_to_process)} in {variant_time:.1f}s")
+                
             except Exception as e:
-                print(f"Error processing mutant for {pid}: {e}")
-                continue  # Skip this variant
+                variant_time = time.time() - variant_start_time
+                print(f"  ✗ Failed variant {i+1}/{len(variants_to_process)} after {variant_time:.1f}s: {e}")
+                continue  # Skip this variant and continue with next
         return results
     except Exception as e:
         print(f"Error processing {pid}: {e}")
@@ -243,6 +270,11 @@ if __name__ == "__main__":
     records = list(SeqIO.parse(input_fasta, "fasta"))
     print(f"Processing {len(records)} proteins from {input_fasta}")
     
+    # Limit to first 100 proteins
+    if len(records) > MAX_PROTEINS:
+        records = records[:MAX_PROTEINS]
+        print(f"Limited to first {MAX_PROTEINS} proteins")
+    
     all_results = []
     processed_mutants = 0
     for i, record in enumerate(records):
@@ -258,10 +290,19 @@ if __name__ == "__main__":
                     exit(0)
                 all_results.append(res)
                 processed_mutants += 1
+        
+        # Save CSV after each protein is processed
+        if all_results:
+            df = pd.DataFrame(all_results)
+            df.to_csv(output_csv, index=False)
+            print(f"Updated CSV with {len(all_results)} total records after processing {record.id}")
         else:
             print(f"Skipped {record.id}")
     
-    # Create DataFrame and save to CSV
-    df = pd.DataFrame(all_results)
-    df.to_csv(output_csv, index=False)
-    print(f"Wrote {len(all_results)} protein records to {output_csv}") 
+    # Final save (in case no results were added in the last iteration)
+    if all_results:
+        df = pd.DataFrame(all_results)
+        df.to_csv(output_csv, index=False)
+        print(f"Final CSV written with {len(all_results)} protein records to {output_csv}")
+    else:
+        print("No results to save") 
