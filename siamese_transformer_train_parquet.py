@@ -22,7 +22,7 @@ from siamese_parquet_dataset import SiameseParquetDataset, siamese_collate_fn
 from siamese_loss import TMLDDTLoss
 
 
-def train_transformer_siamese_network_parquet(config=None):
+def train_transformer_siamese_network_parquet(config=None, resume_from=None):
     """
     Train the transformer-based Siamese network using Parquet data from GCS.
     
@@ -35,7 +35,7 @@ def train_transformer_siamese_network_parquet(config=None):
     
     # Create dataset from Parquet files
     dataset = SiameseParquetDataset(
-        gcs_folder=config.get('gcs_folder', 'gs://jx-compbio/testing_data/'),
+        gcs_folder=config.get('gcs_folder', 'gs://primes-bucket/testing_data_weight5/'),
         max_len=config.get('max_seq_len', 300),
         gcs_project=config.get('gcs_project', None),
         key_path=config.get('key_path', 'mit-primes-464001-bfa03c2c5999.json')
@@ -44,6 +44,7 @@ def train_transformer_siamese_network_parquet(config=None):
     print(f"Dataset has {len(dataset)} samples")
     
     # Create model
+    print(f"num_layers: {config['num_layers']}")
     model = SiameseTransformerNet(
         input_dim=config['prottrans_dim'],
         hidden_dim=config['hidden_dim'],
@@ -59,8 +60,7 @@ def train_transformer_siamese_network_parquet(config=None):
     # Create custom loss function
     criterion = TMLDDTLoss(
         alpha=config['alpha'],
-        beta=config['beta'],
-        gamma=config['gamma']
+        beta=config['beta']
     ).to(device)
     
     # Create optimizer
@@ -75,11 +75,23 @@ def train_transformer_siamese_network_parquet(config=None):
         optimizer, mode='min', factor=0.5, patience=5
     )
     
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    if resume_from is not None:
+        print(f"Resuming from checkpoint: {resume_from}")
+        fs = gcsfs.GCSFileSystem(project=config['gcs_project'], token=config['key_path'])
+        with fs.open(resume_from, 'rb') as f:
+            checkpoint = torch.load(f, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        print(f"Resumed model and optimizer from epoch {start_epoch}")
+    
     # Training loop
     best_loss = float('inf')
     training_history = []
     
-    for epoch in range(config['num_epochs']):
+    for epoch in range(start_epoch, config['num_epochs']):
         # reshuffle Dataset cache at the start of each epoch
         dataset._build_shuffled_index_cache()
         # re-create DataLoader for the new shuffled data
@@ -95,7 +107,6 @@ def train_transformer_siamese_network_parquet(config=None):
         model.train()
         total_loss = 0.0
         total_residue_loss = 0.0
-        total_weighted_loss = 0.0
         total_global_loss = 0.0
         batches_processed = 0
         
@@ -112,20 +123,18 @@ def train_transformer_siamese_network_parquet(config=None):
             seqxA_list = batch['seqxA']
             seqM_list = batch['seqM']
             seqyA_list = batch['seqyA']
-            
-            # Count actual pairs in this batch
-            batch_size = len(seqxA_list)
-            batches_processed += 1
-            
+
             # Forward pass with masks
             new_emb1, new_emb2, global_emb1, global_emb2 = model(
                 emb1, emb2, mask1, mask2
             )
-            
-            # Compute loss
+
+            # Compute loss, passing the thresholds
             loss, loss_dict = criterion(
                 new_emb1, new_emb2, global_emb1, global_emb2,
-                tm_scores, lddt_scores, seqxA_list, seqM_list, seqyA_list
+                tm_scores, lddt_scores, seqxA_list, seqM_list, seqyA_list,
+                min_tm_score_for_global=config['min_tm_score_for_global'],
+                min_tm_score_for_lddt=config['min_tm_score_for_lddt']
             )
             
             # Backward pass
@@ -138,16 +147,15 @@ def train_transformer_siamese_network_parquet(config=None):
             optimizer.step()
             
             # Update metrics
+            batches_processed += 1
             total_loss += loss.item()
             total_residue_loss += loss_dict['residue_loss'].item()
-            total_weighted_loss += loss_dict['weighted_loss'].item()
             total_global_loss += loss_dict['global_loss'].item()
             
             # Update progress bar
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'Residue': f'{loss_dict["residue_loss"].item():.4f}',
-                'Weighted Residue': f'{loss_dict["weighted_loss"].item():.4f}',
                 'Global': f'{loss_dict["global_loss"].item():.4f}',
                 'Batch': f'{batch_idx+1}/{len(dataloader)}'
             })
@@ -155,7 +163,6 @@ def train_transformer_siamese_network_parquet(config=None):
         # Compute average losses
         avg_loss = total_loss / batches_processed
         avg_residue_loss = total_residue_loss / batches_processed
-        avg_weighted_loss = total_weighted_loss / batches_processed
         avg_global_loss = total_global_loss / batches_processed
         
         # Update learning rate
@@ -166,18 +173,23 @@ def train_transformer_siamese_network_parquet(config=None):
             'epoch': epoch + 1,
             'avg_loss': avg_loss,
             'avg_residue_loss': avg_residue_loss,
-            'avg_weighted_loss': avg_weighted_loss,
             'avg_global_loss': avg_global_loss,
             'learning_rate': optimizer.param_groups[0]['lr'],
             'batches_processed': batches_processed
         }
         training_history.append(epoch_history)
         
+        # Save training history JSON to GCS every epoch
+        gcs_history_path = 'gcs://primes-bucket/models/model_history.json'
+        fs = gcsfs.GCSFileSystem(project=config['gcs_project'], token=config['key_path'])
+        with fs.open(gcs_history_path, 'w') as f:
+            json.dump(training_history, f, indent=2)
+        print(f'Saved training history to {gcs_history_path}')
+        
         # Print epoch summary
         print(f'Epoch {epoch+1}/{config["num_epochs"]}:')
         print(f'  Average Loss: {avg_loss:.4f}')
         print(f'  Residue Loss: {avg_residue_loss:.4f}')
-        print(f'  Weighted Residue Loss: {avg_weighted_loss:.4f}')
         print(f'  Global Loss: {avg_global_loss:.4f}')
         print(f'  Batches Processed: {batches_processed}')
         print()
@@ -186,7 +198,7 @@ def train_transformer_siamese_network_parquet(config=None):
         if avg_loss < best_loss:
             best_loss = avg_loss
             fs = gcsfs.GCSFileSystem(project=config['gcs_project'], token=config['key_path'])
-            with fs.open('gcs://jx-compbio/models/model.pth', 'wb') as f:
+            with fs.open('gcs://primes-bucket/models/model.pth', 'wb') as f:
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
@@ -213,32 +225,27 @@ def main():
         'num_layers': 2,            # Number of transformer layers
         'dropout': 0.1,             # Dropout rate
         'batch_size': 16,           # Batch size for training
-        'num_workers': 4,           # Number of workers for data loading
+        'num_workers': 0,           # Number of workers for data loading
         'num_epochs': 5,            # Number of training epochs
         'learning_rate': 1e-4,      # Learning rate
         'weight_decay': 1e-5,       # Weight decay
         'max_grad_norm': 1.0,       # Gradient clipping
         'alpha': 0.7,               # Weight for per-residue loss
         'beta': 0.3,                # Weight for global loss
-        'gamma': 0.1,               # Weight for weighted per-residue loss
-        'gcs_folder': 'gs://jx-compbio/testing_data/', # GCS folder containing Parquet files
+        'gcs_folder': 'gs://primes-bucket/testing_data_weight5/', # GCS folder containing Parquet files
         'gcs_project': 'mit-primes-464001',        # GCS project (optional)
-        'key_path': 'mit-primes-464001-bfa03c2c5999.json'  # GCS service account key path (required)
+        'key_path': 'mit-primes-464001-bfa03c2c5999.json',  # GCS service account key path (required)
+        'min_tm_score_for_global': 0.1,           # Minimum TM-score for global loss
+        'min_tm_score_for_lddt': 0.7,             # Minimum TM-score for lDDT loss
     }
     
     print(f"Training SiameseTransformerNet with Parquet data from GCS...")
     print("Loss strategy:")
     print("- TM < 0.1: No loss (too chaotic)")
-    print("- TM 0.1-0.4: TM score only")
-    print("- TM 0.4-1.0: TM + LDDT scores")
+    print("- TM 0.1-0.7: TM score only")
+    print("- TM 0.7-1.0: TM + LDDT scores")
     
-    model, history = train_transformer_siamese_network_parquet(config=config)
-    
-    # Save training history to GCS
-    fs = gcsfs.GCSFileSystem(project=config['gcs_project'], token=config['key_path'])
-    gcs_history_path = 'gcs://jx-compbio/models/model_history.json'
-    with fs.open(gcs_history_path, 'w') as f:
-        json.dump(history, f, indent=2)
+    model, history = train_transformer_siamese_network_parquet(config=config, resume_from=None)
     
     print("Training completed!")
     print(f"Training history saved to GCS: {gcs_history_path}")

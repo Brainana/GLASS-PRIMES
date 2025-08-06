@@ -135,40 +135,22 @@ def compute_statistics(predicted_scores, true_scores):
 
 def plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_predicted_scores, output_prefix):
     """Plot the distribution of errors and absolute errors."""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     
     # Error distribution
-    axes[0, 0].hist(all_errors, bins=50, alpha=0.7, color='blue', edgecolor='black')
-    axes[0, 0].set_title('Distribution of Errors (Predicted - True)')
-    axes[0, 0].set_xlabel('Error')
-    axes[0, 0].set_ylabel('Frequency')
-    axes[0, 0].set_xlim(-0.1, 0.1)  # Set x-axis limits
-    axes[0, 0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    axes[0].hist(all_errors, bins=200, alpha=0.7, color='blue', edgecolor='black')
+    axes[0].set_title('Distribution of Errors (Predicted - True)')
+    axes[0].set_xlabel('Error')
+    axes[0].set_ylabel('Frequency')
+    axes[0].set_xlim(-0.0075, 0.0075)  # Set x-axis limits
+    axes[0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
     
     # Absolute error distribution
-    axes[0, 1].hist(all_abs_errors, bins=50, alpha=0.7, color='green', edgecolor='black')
-    axes[0, 1].set_title('Distribution of Absolute Errors')
-    axes[0, 1].set_xlabel('Absolute Error')
-    axes[0, 1].set_ylabel('Frequency')
-    axes[0, 1].set_xlim(0, 0.1)  # Set x-axis limits
-    
-    # Error vs True score scatter
-    axes[1, 0].scatter(all_true_scores, all_errors, alpha=0.5, s=1)
-    axes[1, 0].set_title('Error vs True Score')
-    axes[1, 0].set_xlabel('True lDDT Score')
-    axes[1, 0].set_ylabel('Error')
-    axes[1, 0].axhline(y=0, color='red', linestyle='--', alpha=0.7)
-    
-    # Predicted vs True score scatter
-    axes[1, 1].scatter(all_true_scores, all_predicted_scores, alpha=0.5, s=1)
-    axes[1, 1].set_title('Predicted vs True Score')
-    axes[1, 1].set_xlabel('True lDDT Score')
-    axes[1, 1].set_ylabel('Predicted lDDT Score')
-    
-    # Add perfect prediction line
-    min_val = min(all_true_scores.min(), all_predicted_scores.min())
-    max_val = max(all_true_scores.max(), all_predicted_scores.max())
-    axes[1, 1].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7)
+    axes[1].hist(all_abs_errors, bins=200, alpha=0.7, color='green', edgecolor='black')
+    axes[1].set_title('Distribution of Absolute Errors')
+    axes[1].set_xlabel('Absolute Error')
+    axes[1].set_ylabel('Frequency')
+    axes[1].set_xlim(0, 0.0075)  # Set x-axis limits
     
     plt.tight_layout()
     plt.savefig(f'{output_prefix}_loss_distribution.png', dpi=300, bbox_inches='tight')
