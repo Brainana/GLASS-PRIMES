@@ -17,6 +17,7 @@ from lddt_weighted import LDDTCalculatorWeighted
 from pathlib import Path
 import matplotlib.pyplot as plt
 import ast
+from embed_structure_model import trans_basic_block, trans_basic_block_Config
 
 if len(sys.argv) != 3:
     print("Usage: python analyze_lddt_scores.py <input_csv> <model_checkpoint>")
@@ -101,6 +102,64 @@ def get_predicted_lddt_scores(wild_seq, mutant_seq, model, device):
     
     return per_res_sim
 
+def get_predicted_tm_score(wild_seq, mutant_seq, model, device):
+    """Get predicted TM score using the Siamese model."""
+    # Get embeddings
+    emb_wt, mask_wt = get_prott5_embedding(wild_seq)
+    emb_mut, mask_mut = get_prott5_embedding(mutant_seq)
+    emb_wt = emb_wt.to(device)
+    emb_mut = emb_mut.to(device)
+    mask_wt = mask_wt.to(device)
+    mask_mut = mask_mut.to(device)
+
+    # Get model outputs
+    model.eval()
+    with torch.no_grad():
+        emb_wt = emb_wt.unsqueeze(0)
+        emb_mut = emb_mut.unsqueeze(0)
+        mask_wt = mask_wt.unsqueeze(0)
+        mask_mut = mask_mut.unsqueeze(0)
+        new_emb1, new_emb2, global_emb1, global_emb2 = model(emb_wt, emb_mut, mask_wt, mask_mut)
+
+    # Compute TM score from global embeddings
+    global_sim = F.cosine_similarity(global_emb1, global_emb2, dim=1)  # [batch]
+    predicted_tm_score = (global_sim + 1) / 2  # Normalize from [-1,1] to [0,1] range
+    predicted_tm_score = predicted_tm_score.cpu().numpy()[0]  # Get scalar value
+    
+    return predicted_tm_score
+
+def calculate_tm_score_with_tmvec(wild_seq, mutant_seq, tmvec_model):
+    """Calculate TM-score using tm_vec model."""
+    try:
+        # Get ProtT5 embeddings
+        emb_wt, mask_wt = get_prott5_embedding(wild_seq)
+        emb_mut, mask_mut = get_prott5_embedding(mutant_seq)
+        emb_wt = emb_wt.to(device)
+        emb_mut = emb_mut.to(device)
+        mask_wt = mask_wt.to(device)
+        mask_mut = mask_mut.to(device)
+        
+        # Add batch dimension
+        emb_wt = emb_wt.unsqueeze(0)
+        emb_mut = emb_mut.unsqueeze(0)
+        mask_wt = mask_wt.unsqueeze(0)
+        mask_mut = mask_mut.unsqueeze(0)
+        
+        # Get tm_vec embeddings
+        tmvec_model.eval()
+        with torch.no_grad():
+            out1_tmvec = tmvec_model.forward(emb_wt, src_mask=None, src_key_padding_mask=(mask_wt == 0))
+            out2_tmvec = tmvec_model.forward(emb_mut, src_mask=None, src_key_padding_mask=(mask_mut == 0))
+            
+            # Calculate cosine similarity
+            tm_score = torch.nn.functional.cosine_similarity(out1_tmvec, out2_tmvec).item()
+            
+            return tm_score
+            
+    except Exception as e:
+        print(f"Error calculating TM score with tm_vec: {e}")
+        return 0.0
+
 def compute_statistics(predicted_scores, true_scores):
     """Compute various statistics between predicted and true scores."""
     # Ensure same length
@@ -133,24 +192,93 @@ def compute_statistics(predicted_scores, true_scores):
         'abs_errors': abs_errors
     }
 
-def plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_predicted_scores, output_prefix):
-    """Plot the distribution of errors and absolute errors."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+def compute_tm_statistics(predicted_tm_scores, true_tm_scores):
+    """Compute statistics for TM scores."""
+    # Filter out invalid scores (0 or negative)
+    valid_indices = (true_tm_scores > 0) & (predicted_tm_scores > 0)
+    if not np.any(valid_indices):
+        return {
+            'mae': 0.0, 'mse': 0.0, 'rmse': 0.0, 'std_error': 0.0, 
+            'std_abs_error': 0.0, 'correlation': 0.0, 'valid_count': 0
+        }
     
-    # Error distribution
-    axes[0].hist(all_errors, bins=200, alpha=0.7, color='blue', edgecolor='black')
-    axes[0].set_title('Distribution of Errors (Predicted - True)')
-    axes[0].set_xlabel('Error')
-    axes[0].set_ylabel('Frequency')
-    axes[0].set_xlim(-0.0075, 0.0075)  # Set x-axis limits
-    axes[0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    pred_valid = predicted_tm_scores[valid_indices]
+    true_valid = true_tm_scores[valid_indices]
     
-    # Absolute error distribution
-    axes[1].hist(all_abs_errors, bins=200, alpha=0.7, color='green', edgecolor='black')
-    axes[1].set_title('Distribution of Absolute Errors')
-    axes[1].set_xlabel('Absolute Error')
-    axes[1].set_ylabel('Frequency')
-    axes[1].set_xlim(0, 0.0075)  # Set x-axis limits
+    # Compute errors
+    errors = pred_valid - true_valid
+    abs_errors = np.abs(errors)
+    
+    # Statistics
+    mae = np.mean(abs_errors)
+    mse = np.mean(errors ** 2)
+    rmse = np.sqrt(mse)
+    std_error = np.std(errors)
+    std_abs_error = np.std(abs_errors)
+    
+    # Correlation
+    correlation = np.corrcoef(pred_valid, true_valid)[0, 1]
+    
+    return {
+        'mae': mae,
+        'mse': mse,
+        'rmse': rmse,
+        'std_error': std_error,
+        'std_abs_error': std_abs_error,
+        'correlation': correlation,
+        'valid_count': len(pred_valid)
+    }
+
+def plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_predicted_scores, 
+                          all_tm_errors, all_tm_abs_errors, all_true_tm_scores, all_predicted_tm_scores, output_prefix):
+    """Plot the distribution of errors and absolute errors for both lDDT and TM scores."""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # === lDDT Score Plots ===
+    # lDDT Error distribution
+    axes[0, 0].hist(all_errors, bins=200, alpha=0.7, color='blue', edgecolor='black')
+    axes[0, 0].set_title('lDDT Error Distribution')
+    axes[0, 0].set_xlabel('Error')
+    axes[0, 0].set_ylabel('Frequency')
+    axes[0, 0].set_xlim(-0.05, 0.05)  # Set x-axis limits
+    axes[0, 0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    
+    # lDDT Absolute error distribution
+    axes[0, 1].hist(all_abs_errors, bins=200, alpha=0.7, color='green', edgecolor='black')
+    axes[0, 1].set_title('lDDT Absolute Error Distribution')
+    axes[0, 1].set_xlabel('Absolute Error')
+    axes[0, 1].set_ylabel('Frequency')
+    axes[0, 1].set_xlim(0, 0.05)  # Set x-axis limits
+    
+    # lDDT Predicted vs True scatter
+    axes[0, 2].scatter(all_true_scores, all_predicted_scores, alpha=0.5, s=1)
+    axes[0, 2].set_title('lDDT Predicted vs True')
+    axes[0, 2].set_xlabel('True lDDT Score')
+    axes[0, 2].set_ylabel('Predicted lDDT Score')
+    axes[0, 2].plot([0, 1], [0, 1], 'r--', alpha=0.7)  # Perfect prediction line
+    
+    # === TM Score Plots ===
+    # TM Error distribution
+    axes[1, 0].hist(all_tm_errors, bins=50, alpha=0.7, color='orange', edgecolor='black')
+    axes[1, 0].set_title('TM Score Error Distribution')
+    axes[1, 0].set_xlabel('Error')
+    axes[1, 0].set_ylabel('Frequency')
+    axes[1, 0].set_xlim(-0.3, 0.3)
+    axes[1, 0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    
+    # TM Absolute error distribution
+    axes[1, 1].hist(all_tm_abs_errors, bins=50, alpha=0.7, color='purple', edgecolor='black')
+    axes[1, 1].set_title('TM Score Absolute Error Distribution')
+    axes[1, 1].set_xlabel('Absolute Error')
+    axes[1, 1].set_ylabel('Frequency')
+    axes[1, 1].set_xlim(0, 0.3)
+    
+    # TM Predicted vs True scatter
+    axes[1, 2].scatter(all_true_tm_scores, all_predicted_tm_scores, alpha=0.5, s=1)
+    axes[1, 2].set_title('TM Score Predicted vs True')
+    axes[1, 2].set_xlabel('True TM Score')
+    axes[1, 2].set_ylabel('Predicted TM Score')
+    axes[1, 2].plot([0, 1], [0, 1], 'r--', alpha=0.7)  # Perfect prediction line
     
     plt.tight_layout()
     plt.savefig(f'{output_prefix}_loss_distribution.png', dpi=300, bbox_inches='tight')
@@ -168,6 +296,13 @@ t5_model.eval()
 print(f"Loading Siamese model from {model_checkpoint}...")
 siamese_model = load_trained_model(model_checkpoint, device)
 
+print("Loading tm_vec model...")
+config = trans_basic_block_Config()
+tmvec_model = trans_basic_block.load_from_checkpoint('tm_vec_swiss_model.ckpt', config=config)
+tmvec_model.eval()
+tmvec_model.freeze()
+tmvec_model = tmvec_model.to(device)
+
 print("Loading lDDT calculator...")
 lddt_calculator = LDDTCalculatorWeighted(weight_exponent=3.0)
 
@@ -180,12 +315,17 @@ all_predicted_scores = []
 all_true_scores = []
 all_errors = []
 all_abs_errors = []
+# TM score tracking
+all_predicted_tm_scores = []
+all_true_tm_scores = []
+all_tm_errors = []
+all_tm_abs_errors = []
 protein_stats = []  # List to store per-protein statistics
 processed_variants = 0  # Counter for processed variants
 
 # Create output CSV
 with open(output_csv, 'w', newline='') as csvfile:
-    fieldnames = ["PID", "sequence", "mutated_sequence", "predicted_lddt_scores", "true_lddt_scores", "description"]
+    fieldnames = ["PID", "sequence", "mutated_sequence", "predicted_lddt_scores", "true_lddt_scores", "predicted_tm_score", "true_tm_score", "description"]
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
     writer.writeheader()
 
@@ -208,11 +348,21 @@ with open(output_csv, 'w', newline='') as csvfile:
             # Get predicted lDDT scores
             predicted_lddt_scores = get_predicted_lddt_scores(wild_seq, mutant_seq, siamese_model, device)
             
+            # Get predicted TM score
+            predicted_tm_score = get_predicted_tm_score(wild_seq, mutant_seq, siamese_model, device)
+            
             # Get true lDDT scores
             true_lddt_scores = lddt_calculator.calculate_lddt(coords, mutant_coords)
             
+            # Calculate true TM score using tm_vec
+            true_tm_score = calculate_tm_score_with_tmvec(wild_seq, mutant_seq, tmvec_model)
+            
             # Compute statistics for this protein
             stats = compute_statistics(predicted_lddt_scores, true_lddt_scores)
+            
+            # Compute TM score error
+            tm_error = predicted_tm_score - true_tm_score
+            tm_abs_error = abs(tm_error)
             
             # Store per-protein statistics
             protein_stats.append({
@@ -220,6 +370,10 @@ with open(output_csv, 'w', newline='') as csvfile:
                 'sequence_length': len(wild_seq),
                 'predicted_mean_lddt': np.mean(predicted_lddt_scores),
                 'true_mean_lddt': np.mean(true_lddt_scores),
+                'predicted_tm_score': predicted_tm_score,
+                'true_tm_score': true_tm_score,
+                'tm_error': tm_error,
+                'tm_abs_error': tm_abs_error,
                 'mae': stats['mae'],
                 'mse': stats['mse'],
                 'rmse': stats['rmse'],
@@ -236,6 +390,11 @@ with open(output_csv, 'w', newline='') as csvfile:
             all_true_scores.extend(true_lddt_scores[:len(predicted_lddt_scores)])
             all_errors.extend(stats['errors'])
             all_abs_errors.extend(stats['abs_errors'])
+            # Collect TM score data
+            all_predicted_tm_scores.append(predicted_tm_score)
+            all_true_tm_scores.append(true_tm_score)
+            all_tm_errors.append(tm_error)
+            all_tm_abs_errors.append(tm_abs_error)
             processed_variants += 1
             
             # Write to CSV
@@ -245,15 +404,20 @@ with open(output_csv, 'w', newline='') as csvfile:
                 "mutated_sequence": mutant_seq,
                 "predicted_lddt_scores": list(predicted_lddt_scores),
                 "true_lddt_scores": list(true_lddt_scores),
+                "predicted_tm_score": predicted_tm_score,
+                "true_tm_score": true_tm_score,
                 "description": row.get("description", "")
             })
             
             # Print summary with statistics
             print(f"  Predicted mean lDDT: {np.mean(predicted_lddt_scores):.4f}")
             print(f"  True mean lDDT: {np.mean(true_lddt_scores):.4f}")
-            print(f"  MAE: {stats['mae']:.4f}")
-            print(f"  RMSE: {stats['rmse']:.4f}")
-            print(f"  Correlation: {stats['correlation']:.4f}")
+            print(f"  Predicted TM score: {predicted_tm_score:.4f}")
+            print(f"  True TM score: {true_tm_score:.4f}")
+            print(f"  TM error: {tm_error:.4f}")
+            print(f"  lDDT MAE: {stats['mae']:.4f}")
+            print(f"  lDDT RMSE: {stats['rmse']:.4f}")
+            print(f"  lDDT Correlation: {stats['correlation']:.4f}")
             
         except Exception as e:
             print(f"Error processing {row['PID']}: {e}")
@@ -264,6 +428,11 @@ all_predicted_scores = np.array(all_predicted_scores)
 all_true_scores = np.array(all_true_scores)
 all_errors = np.array(all_errors)
 all_abs_errors = np.array(all_abs_errors)
+# Convert TM score arrays
+all_predicted_tm_scores = np.array(all_predicted_tm_scores)
+all_true_tm_scores = np.array(all_true_tm_scores)
+all_tm_errors = np.array(all_tm_errors)
+all_tm_abs_errors = np.array(all_tm_abs_errors)
 
 # Save per-protein statistics to CSV
 protein_stats_csv = output_csv.replace('.csv', '_protein_statistics.csv')
@@ -273,19 +442,32 @@ print(f"Saved per-protein statistics to: {protein_stats_csv}")
 
 # Compute and print overall statistics (not saved)
 overall_stats = compute_statistics(all_predicted_scores, all_true_scores)
+overall_tm_stats = compute_tm_statistics(all_predicted_tm_scores, all_true_tm_scores)
 
 print(f"\n=== OVERALL STATISTICS ===")
 print(f"Total protein variants processed: {processed_variants}")
 print(f"Total residues processed: {len(all_predicted_scores)}")
-print(f"MAE: {overall_stats['mae']:.4f}")
-print(f"MSE: {overall_stats['mse']:.4f}")
-print(f"RMSE: {overall_stats['rmse']:.4f}")
-print(f"Standard Deviation of Errors: {overall_stats['std_error']:.4f}")
-print(f"Standard Deviation of Absolute Errors: {overall_stats['std_abs_error']:.4f}")
-print(f"Correlation: {overall_stats['correlation']:.4f}")
+print(f"Valid TM score pairs: {overall_tm_stats['valid_count']}")
+
+print(f"\n=== lDDT STATISTICS ===")
+print(f"lDDT MAE: {overall_stats['mae']:.4f}")
+print(f"lDDT MSE: {overall_stats['mse']:.4f}")
+print(f"lDDT RMSE: {overall_stats['rmse']:.4f}")
+print(f"lDDT Standard Deviation of Errors: {overall_stats['std_error']:.4f}")
+print(f"lDDT Standard Deviation of Absolute Errors: {overall_stats['std_abs_error']:.4f}")
+print(f"lDDT Correlation: {overall_stats['correlation']:.4f}")
+
+print(f"\n=== TM SCORE STATISTICS ===")
+print(f"TM MAE: {overall_tm_stats['mae']:.4f}")
+print(f"TM MSE: {overall_tm_stats['mse']:.4f}")
+print(f"TM RMSE: {overall_tm_stats['rmse']:.4f}")
+print(f"TM Standard Deviation of Errors: {overall_tm_stats['std_error']:.4f}")
+print(f"TM Standard Deviation of Absolute Errors: {overall_tm_stats['std_abs_error']:.4f}")
+print(f"TM Correlation: {overall_tm_stats['correlation']:.4f}")
 
 # Create loss distribution plot
 output_prefix = output_csv.replace('.csv', '')
-plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_predicted_scores, output_prefix)
+plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_predicted_scores, 
+                      all_tm_errors, all_tm_abs_errors, all_true_tm_scores, all_predicted_tm_scores, output_prefix)
 
-print(f"\nGenerated lDDT comparison CSV: {output_csv}")
+print(f"\nGenerated scores comparison CSV: {output_csv}")
