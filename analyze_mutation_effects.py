@@ -111,7 +111,6 @@ def analyze_mutation_effect(wild_seq, mutant_seq, model, device, true_tm_score=N
     plt.xlabel('Residue position')
     plt.ylabel('Cosine similarity / lDDT')
     plt.title('Per-residue similarity between wild-type and mutant')
-    plt.ylim(0.6, 1)
     plt.legend()
     plt.tight_layout()
     plt.show()

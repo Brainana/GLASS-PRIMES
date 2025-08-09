@@ -10,9 +10,12 @@ import pandas as pd
 import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from transformers import T5EncoderModel, T5Tokenizer
+import gcsfs 
 
 from siamese_transformer_model import SiameseTransformerNet
 from siamese_parquet_dataset import SiameseParquetDataset, siamese_collate_fn
+from embed_structure_model import trans_basic_block, trans_basic_block_Config
 
 
 def load_trained_model(model_path, device, config):
@@ -34,8 +37,36 @@ def load_trained_model(model_path, device, config):
     model.eval()
     return model
 
+def get_prott5_embedding(seq, tokenizer, t5_model, device, pad_len=300):
+    """Get ProtT5 embedding for a sequence."""
+    seq_spaced = ' '.join(list(seq))
+    inputs = tokenizer(seq_spaced, return_tensors='pt', padding='max_length', truncation=True, max_length=pad_len)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = t5_model(**inputs)
+        emb = outputs.last_hidden_state[0]
+    if emb.size(0) < pad_len:
+        pad = torch.zeros(pad_len - emb.size(0), emb.size(1), device=emb.device)
+        emb = torch.cat([emb, pad], dim=0)
+    else:
+        emb = emb[:pad_len]
+    attn_mask = inputs['attention_mask'][0]
+    return emb, attn_mask
 
-def evaluate_model(model, dataloader, device):
+def get_tmvec_prediction(emb1, emb2, mask1, mask2, tmvec_model, device):
+    """Get tm_vec prediction for a pair of embeddings."""
+    tmvec_model.eval()
+    with torch.no_grad():
+        out1_tmvec = tmvec_model.forward(emb1, src_mask=None, src_key_padding_mask=(mask1 == 0))
+        out2_tmvec = tmvec_model.forward(emb2, src_mask=None, src_key_padding_mask=(mask2 == 0))
+        
+        # Calculate cosine similarity
+        tm_score = torch.nn.functional.cosine_similarity(out1_tmvec, out2_tmvec).item()
+        
+        return tm_score
+
+
+def evaluate_model(model, dataloader, device, tmvec_model=None, tokenizer=None, t5_model=None):
     """
     Evaluate the model and compute mean absolute loss.
     
@@ -43,6 +74,9 @@ def evaluate_model(model, dataloader, device):
         model: Trained Siamese transformer model
         dataloader: DataLoader with evaluation data
         device: Device to run evaluation on
+        tmvec_model: tm_vec model for comparison
+        tokenizer: ProtT5 tokenizer
+        t5_model: ProtT5 model
     
     Returns:
         Dictionary with evaluation metrics
@@ -58,6 +92,11 @@ def evaluate_model(model, dataloader, device):
     all_true_tm_scores = []
     all_tm_errors = []
     all_tm_abs_errors = []
+    
+    # tm_vec evaluation
+    all_tmvec_tm_scores = []
+    all_tmvec_tm_errors = []
+    all_tmvec_tm_abs_errors = []
     
     print("Evaluating model...")
     batch_count = 0
@@ -82,6 +121,20 @@ def evaluate_model(model, dataloader, device):
                 global_sim = F.cosine_similarity(global_emb1, global_emb2, dim=1)  # [batch]
                 predicted_tm_scores = (global_sim + 1) / 2  # Normalize from [-1,1] to [0,1] range
                 predicted_tm_scores = predicted_tm_scores.cpu().numpy()
+                
+                # Get tm_vec predictions if available
+                tmvec_tm_scores = []
+                if tmvec_model is not None:
+                    for i in range(emb1.size(0)):
+                        tmvec_score = get_tmvec_prediction(
+                            emb1[i:i+1], emb2[i:i+1], 
+                            mask1[i:i+1], mask2[i:i+1], 
+                            tmvec_model, device
+                        )
+                        tmvec_tm_scores.append(tmvec_score)
+                    tmvec_tm_scores = np.array(tmvec_tm_scores)
+                else:
+                    tmvec_tm_scores = np.zeros(emb1.size(0))
                 
                 # Compute per-residue similarity (normalized to [0,1] range)
                 new_emb1 = new_emb1.view(new_emb1.size(0), -1, new_emb1.size(-1))  # [batch, seq_len, dim]
@@ -173,6 +226,13 @@ def evaluate_model(model, dataloader, device):
                     tm_abs_error = abs(tm_error)
                     all_tm_errors.append(tm_error)
                     all_tm_abs_errors.append(tm_abs_error)
+                    
+                    # Store tm_vec TM score results
+                    all_tmvec_tm_scores.append(tmvec_tm_scores[i])
+                    tmvec_tm_error = tmvec_tm_scores[i] - tm_scores[i]
+                    tmvec_tm_abs_error = abs(tmvec_tm_error)
+                    all_tmvec_tm_errors.append(tmvec_tm_error)
+                    all_tmvec_tm_abs_errors.append(tmvec_tm_abs_error)
                 
                 print(f"  Batch {batch_count} completed successfully")
                 
@@ -196,6 +256,11 @@ def evaluate_model(model, dataloader, device):
     all_tm_errors = np.array(all_tm_errors)
     all_tm_abs_errors = np.array(all_tm_abs_errors)
     
+    # Convert tm_vec arrays
+    all_tmvec_tm_scores = np.array(all_tmvec_tm_scores)
+    all_tmvec_tm_errors = np.array(all_tmvec_tm_errors)
+    all_tmvec_tm_abs_errors = np.array(all_tmvec_tm_abs_errors)
+    
     # Compute lDDT statistics
     mae = np.mean(all_abs_errors)
     mse = np.mean(all_errors ** 2)
@@ -211,6 +276,14 @@ def evaluate_model(model, dataloader, device):
     tm_std_error = np.std(all_tm_errors)
     tm_std_abs_error = np.std(all_tm_abs_errors)
     tm_correlation = np.corrcoef(all_predicted_tm_scores, all_true_tm_scores)[0, 1]
+    
+    # Compute tm_vec statistics
+    tmvec_mae = np.mean(all_tmvec_tm_abs_errors)
+    tmvec_mse = np.mean(all_tmvec_tm_errors ** 2)
+    tmvec_rmse = np.sqrt(tmvec_mse)
+    tmvec_std_error = np.std(all_tmvec_tm_errors)
+    tmvec_std_abs_error = np.std(all_tmvec_tm_abs_errors)
+    tmvec_correlation = np.corrcoef(all_tmvec_tm_scores, all_true_tm_scores)[0, 1]
     
     return {
         'mae': mae,
@@ -235,7 +308,17 @@ def evaluate_model(model, dataloader, device):
         'predicted_tm_scores': all_predicted_tm_scores,
         'true_tm_scores': all_true_tm_scores,
         'tm_errors': all_tm_errors,
-        'tm_abs_errors': all_tm_abs_errors
+        'tm_abs_errors': all_tm_abs_errors,
+        # tm_vec statistics
+        'tmvec_mae': tmvec_mae,
+        'tmvec_mse': tmvec_mse,
+        'tmvec_rmse': tmvec_rmse,
+        'tmvec_std_error': tmvec_std_error,
+        'tmvec_std_abs_error': tmvec_std_abs_error,
+        'tmvec_correlation': tmvec_correlation,
+        'tmvec_tm_scores': all_tmvec_tm_scores,
+        'tmvec_tm_errors': all_tmvec_tm_errors,
+        'tmvec_tm_abs_errors': all_tmvec_tm_abs_errors
     }
 
 
@@ -300,7 +383,7 @@ def main():
     MODEL_PATH = '07.26-2000parquet.pth'  # Path to trained model checkpoint
     GCS_FOLDER = 'gs://primes-bucket/testing_data2/'  # GCS folder with parquet files
     GCS_PROJECT = 'mit-primes-464001'  # GCS project ID
-    KEY_PATH = 'mit-primes-464001-bfa03c2c5999.json'  # Path to GCS service account key
+    KEY_PATH = None  # Set to None to use default credentials, or path to service account key
     BATCH_SIZE = 32  # Batch size for evaluation
     MAX_SEQ_LEN = 300  # Maximum sequence length
     OUTPUT_PREFIX = 'evaluation'  # Output prefix for results
@@ -321,9 +404,24 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load model
-    print(f"Loading model from {MODEL_PATH}...")
+    # Load Siamese model
+    print(f"Loading Siamese model from {MODEL_PATH}...")
     model = load_trained_model(MODEL_PATH, device, MODEL_CONFIG)
+    
+    # Load tm_vec model
+    print("Loading tm_vec model...")
+    config = trans_basic_block_Config()
+    tmvec_model = trans_basic_block.load_from_checkpoint('tm_vec_swiss_model.ckpt', config=config)
+    tmvec_model.eval()
+    tmvec_model.freeze()
+    tmvec_model = tmvec_model.to(device)
+    
+    # Load ProtT5 model and tokenizer
+    print("Loading ProtT5 model and tokenizer...")
+    MODEL_NAME = "Rostlab/prot_t5_xl_uniref50"
+    tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME, do_lower_case=False)
+    t5_model = T5EncoderModel.from_pretrained(MODEL_NAME).to(device)
+    t5_model.eval()
     
     # Create dataset with only first 3 parquet files
     print(f"Loading dataset from {GCS_FOLDER}...")
@@ -357,7 +455,7 @@ def main():
     print(f"DataLoader created successfully with {len(dataloader)} batches")
     
     # Evaluate model
-    results = evaluate_model(model, dataloader, device)
+    results = evaluate_model(model, dataloader, device, tmvec_model, tokenizer, t5_model)
     
     # Print results
     print(f"\n=== lDDT EVALUATION RESULTS ===")
@@ -369,7 +467,7 @@ def main():
     print(f"Standard Deviation of Absolute Errors: {results['std_abs_error']:.4f}")
     print(f"Correlation: {results['correlation']:.4f}")
     
-    print(f"\n=== TM SCORE EVALUATION RESULTS ===")
+    print(f"\n=== TM SCORE EVALUATION RESULTS (Siamese Model) ===")
     print(f"Total pairs evaluated: {results['total_pairs']}")
     print(f"TM MAE: {results['tm_mae']:.4f}")
     print(f"TM MSE: {results['tm_mse']:.4f}")
@@ -377,6 +475,14 @@ def main():
     print(f"TM Standard Deviation of Errors: {results['tm_std_error']:.4f}")
     print(f"TM Standard Deviation of Absolute Errors: {results['tm_std_abs_error']:.4f}")
     print(f"TM Correlation: {results['tm_correlation']:.4f}")
+    
+    print(f"\n=== TM SCORE EVALUATION RESULTS (tm_vec Model) ===")
+    print(f"TM MAE: {results['tmvec_mae']:.4f}")
+    print(f"TM MSE: {results['tmvec_mse']:.4f}")
+    print(f"TM RMSE: {results['tmvec_rmse']:.4f}")
+    print(f"TM Standard Deviation of Errors: {results['tmvec_std_error']:.4f}")
+    print(f"TM Standard Deviation of Absolute Errors: {results['tmvec_std_abs_error']:.4f}")
+    print(f"TM Correlation: {results['tmvec_correlation']:.4f}")
     
     # Save results to CSV
     results_df = pd.DataFrame([
@@ -438,7 +544,33 @@ def main():
         }, {
             'metric': 'tm_correlation',
             'value': results['tm_correlation'],
-            'description': 'TM Score Pearson Correlation Coefficient'
+            'description': 'TM Score Pearson Correlation Coefficient (Siamese)'
+        },
+        # tm_vec metrics
+        {
+            'metric': 'tmvec_mae',
+            'value': results['tmvec_mae'],
+            'description': 'TM Score Mean Absolute Error (tm_vec)'
+        }, {
+            'metric': 'tmvec_mse',
+            'value': results['tmvec_mse'],
+            'description': 'TM Score Mean Squared Error (tm_vec)'
+        }, {
+            'metric': 'tmvec_rmse',
+            'value': results['tmvec_rmse'],
+            'description': 'TM Score Root Mean Squared Error (tm_vec)'
+        }, {
+            'metric': 'tmvec_std_error',
+            'value': results['tmvec_std_error'],
+            'description': 'TM Score Standard Deviation of Errors (tm_vec)'
+        }, {
+            'metric': 'tmvec_std_abs_error',
+            'value': results['tmvec_std_abs_error'],
+            'description': 'TM Score Standard Deviation of Absolute Errors (tm_vec)'
+        }, {
+            'metric': 'tmvec_correlation',
+            'value': results['tmvec_correlation'],
+            'description': 'TM Score Pearson Correlation Coefficient (tm_vec)'
         }
     ])
     
