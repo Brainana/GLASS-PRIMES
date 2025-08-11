@@ -146,6 +146,8 @@ def plot_distance_matrix(colored_matrix: np.ndarray,
     axes[0].set_title(f'{protein_name}\nDistance Difference Matrix\n(Neighbor Pairs ≤ 15Å)')
     axes[0].set_xlabel('Residue Index')
     axes[0].set_ylabel('Residue Index')
+    axes[0].set_ylim(0, colored_matrix.shape[0])
+    axes[0].set_xlim(0, colored_matrix.shape[1])
     
     # Add colorbar with continuous scale
     cbar1 = plt.colorbar(im1, ax=axes[0])
@@ -156,6 +158,8 @@ def plot_distance_matrix(colored_matrix: np.ndarray,
     axes[1].set_title('Wild-type Distance Matrix')
     axes[1].set_xlabel('Residue Index')
     axes[1].set_ylabel('Residue Index')
+    axes[1].set_ylim(0, wild_dist.shape[0])
+    axes[1].set_xlim(0, wild_dist.shape[1])
     plt.colorbar(im2, ax=axes[1], label='Distance (Å)')
     
     # Plot 3: Distance difference matrix (all pairs)
@@ -163,6 +167,8 @@ def plot_distance_matrix(colored_matrix: np.ndarray,
     axes[2].set_title('Distance Difference Matrix\n(All Pairs)')
     axes[2].set_xlabel('Residue Index')
     axes[2].set_ylabel('Residue Index')
+    axes[2].set_ylim(0, dist_diff.shape[0])
+    axes[2].set_xlim(0, dist_diff.shape[1])
     plt.colorbar(im3, ax=axes[2], label='Distance Difference (Å)')
     
     plt.tight_layout()
@@ -187,9 +193,12 @@ def analyze_neighbor_pairs(colored_matrix: np.ndarray,
     
     for i, threshold in enumerate(thresholds):
         if i == 0:
-            count = np.sum(colored_matrix == i + 1)
+            # Count pairs with distance difference <= 1.0Å
+            count = np.sum((colored_matrix > 0) & (colored_matrix <= threshold))
         else:
-            count = np.sum(colored_matrix == i + 1)
+            # Count pairs with distance difference in range (prev_threshold, threshold]
+            prev_threshold = thresholds[i-1]
+            count = np.sum((colored_matrix > prev_threshold) & (colored_matrix <= threshold))
         counts.append(count)
     
     # Calculate statistics
