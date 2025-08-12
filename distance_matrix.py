@@ -275,12 +275,7 @@ def main():
     print(f"Average neighbor distance: {stats['avg_neighbor_distance']:.2f} Å")
     print(f"Average distance difference: {stats['avg_distance_difference']:.2f} Å")
     print(f"Maximum distance difference: {stats['max_distance_difference']:.2f} Å")
-    
-    print(f"\nDistance difference distribution:")
-    for threshold, count in stats['threshold_counts'].items():
-        percentage = (count / stats['neighbor_pairs']) * 100 if stats['neighbor_pairs'] > 0 else 0
-        print(f"  {threshold}: {count} pairs ({percentage:.1f}%)")
-    
+
     # Create plot
     plot_distance_matrix(colored_matrix, wild_dist, dist_diff, protein_name, 
                         f"{output_prefix}_{protein_name}")

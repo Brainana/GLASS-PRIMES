@@ -54,7 +54,7 @@ def plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_pred
     """Plot the distribution of errors and absolute errors for both lDDT and TM scores."""
     # Set larger font sizes
     plt.rcParams.update({'font.size': 14})
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))  # Shorter height: 8 instead of 12
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))  # Shorter height: 8 instead of 12
     
     # === lDDT Score Plots ===
     # lDDT Error distribution

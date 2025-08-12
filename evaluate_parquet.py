@@ -152,9 +152,8 @@ def evaluate_model(model, dataloader, device, tmvec_model=None, tokenizer=None, 
                 
                 # Handle variable sequence lengths and alignment
                 for i in range(predicted_scores.shape[0]):
-                    # Skip pairs with TM score < 0.7 (not meaningful for lDDT comparison)
-                    if tm_scores[i] < 0.7:
-                        continue
+                    # Skip pairs with TM score < 0.7 for lDDT analysis only
+                    skip_lddt = tm_scores[i] < 0.7
                         
                     # Get alignment sequences
                     seqxA = batch['seqxA'][i]  # Reference sequence
@@ -201,25 +200,18 @@ def evaluate_model(model, dataloader, device, tmvec_model=None, tokenizer=None, 
                         print(f"Number of non-zero true scores: {np.sum(true_seq != 0)}")
                         print(f"================================\n")
                         
-                        # Print every aligned lDDT score difference
-                        print(f"=== ALL ALIGNED lDDT SCORE DIFFERENCES ===")
-                        for pos_idx, (pred_score, true_score) in enumerate(zip(pred_seq, true_seq)):
-                            diff = pred_score - true_score
-                            abs_diff = abs(diff)
-                            print(f"Position {aligned_positions[pos_idx]}: Pred={pred_score:.6f}, True={true_score:.6f}, Diff={diff:.6f}, Abs_Diff={abs_diff:.6f}")
-                        print(f"==========================================\n")
-                    
                     # Compute errors
                     errors = pred_seq - true_seq
                     abs_errors = np.abs(errors)
                     
-                    # Store lDDT results
-                    all_predicted_scores.extend(pred_seq)
-                    all_true_scores.extend(true_seq)
-                    all_errors.extend(errors)
-                    all_abs_errors.extend(abs_errors)
+                    # Store lDDT results (only for TM >= 0.7)
+                    if not skip_lddt:
+                        all_predicted_scores.extend(pred_seq)
+                        all_true_scores.extend(true_seq)
+                        all_errors.extend(errors)
+                        all_abs_errors.extend(abs_errors)
                     
-                    # Store TM score results (for all pairs, not just TM >= 0.7)
+                    # Store TM score results (for all pairs)
                     all_predicted_tm_scores.append(predicted_tm_scores[i])
                     all_true_tm_scores.append(tm_scores[i])
                     tm_error = predicted_tm_scores[i] - tm_scores[i]
@@ -227,7 +219,7 @@ def evaluate_model(model, dataloader, device, tmvec_model=None, tokenizer=None, 
                     all_tm_errors.append(tm_error)
                     all_tm_abs_errors.append(tm_abs_error)
                     
-                    # Store tm_vec TM score results
+                    # Store tm_vec TM score results (for all pairs)
                     all_tmvec_tm_scores.append(tmvec_tm_scores[i])
                     tmvec_tm_error = tmvec_tm_scores[i] - tm_scores[i]
                     tmvec_tm_abs_error = abs(tmvec_tm_error)
@@ -323,58 +315,148 @@ def evaluate_model(model, dataloader, device, tmvec_model=None, tokenizer=None, 
 
 
 def plot_evaluation_results(results, output_prefix):
-    """Plot evaluation results."""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    """Plot evaluation results with comprehensive visualizations."""
+    # Set larger font sizes
+    plt.rcParams.update({'font.size': 14})
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))  # Back to 2x3 layout
     
     # === lDDT Score Plots ===
-    # Error distribution
-    axes[0, 0].hist(results['errors'], bins=50, alpha=0.7, color='blue', edgecolor='black')
+    # lDDT Error distribution
+    axes[0, 0].set_xlim(-0.3, 0.3)  # Set x-axis limits first
+    axes[0, 0].hist(results['errors'], bins=100, alpha=0.7, color='blue', edgecolor='black')
     axes[0, 0].set_title('lDDT Error Distribution')
     axes[0, 0].set_xlabel('Error')
     axes[0, 0].set_ylabel('Frequency')
-    axes[0, 0].set_xlim(-0.3, 0.3)
     axes[0, 0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
     
-    # Absolute error distribution
-    axes[0, 1].hist(results['abs_errors'], bins=50, alpha=0.7, color='green', edgecolor='black')
+    # lDDT Absolute error distribution
+    axes[0, 1].set_xlim(0, 0.3)  # Set x-axis limits first
+    axes[0, 1].hist(results['abs_errors'], bins=100, alpha=0.7, color='green', edgecolor='black')
     axes[0, 1].set_title('lDDT Absolute Error Distribution')
     axes[0, 1].set_xlabel('Absolute Error')
     axes[0, 1].set_ylabel('Frequency')
-    axes[0, 1].set_xlim(0, 0.3)
     
-    # lDDT Error vs True score scatter
-    axes[1, 0].scatter(results['true_scores'], results['errors'], alpha=0.5, s=1)
-    axes[1, 0].set_title('lDDT Error vs True Score')
-    axes[1, 0].set_xlabel('True lDDT Score')
-    axes[1, 0].set_ylabel('Error')
-    axes[1, 0].axhline(y=0, color='red', linestyle='--', alpha=0.7)
+    # === Box Plot for TM Score Errors by Interval ===
+    # Create TM score intervals (5 intervals)
+    tm_intervals = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
+    
+    # Prepare data for box plots - always include all intervals
+    all_error_data = []
+    positions = []
+    colors = []
+    interval_labels = []
+    
+    for i, (start, end) in enumerate(tm_intervals):
+        # Filter data for this interval
+        mask = (results['true_tm_scores'] >= start) & (results['true_tm_scores'] < end)
+        
+        # Always add data for this interval, even if empty
+        if np.sum(mask) > 0:
+            siamese_errors = results['tm_errors'][mask]
+            tmvec_errors = results['tmvec_tm_errors'][mask]
+        else:
+            # Add empty arrays for intervals with no data
+            siamese_errors = np.array([])
+            tmvec_errors = np.array([])
+        
+        # Add Siamese data
+        all_error_data.append(siamese_errors)
+        positions.append(start + (end - start) / 2 - 0.05)  # Center of interval, slightly left
+        colors.append('orange')
+        
+        # Add tm_vec data
+        all_error_data.append(tmvec_errors)
+        positions.append(start + (end - start) / 2 + 0.05)  # Center of interval, slightly right
+        colors.append('cyan')
+        
+        interval_labels.append(f'[{start:.1f},{end:.1f})')
+    
+    # Create box plots - ensure all positions are shown
+    bp = axes[0, 2].boxplot(all_error_data, positions=positions, widths=0.08, patch_artist=True, showfliers=False)
+    
+    # Color the boxes and handle empty data
+    for i, (patch, color) in enumerate(zip(bp['boxes'], colors)):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+        
+        # If this box has no data, make it transparent
+        if len(all_error_data[i]) == 0:
+            patch.set_alpha(0.1)
+    
+    # Set median line colors
+    for i, (median, color) in enumerate(zip(bp['medians'], colors)):
+        median.set_color('red' if color == 'orange' else 'blue')
+        median.set_linewidth(2)
+        
+        # If this box has no data, hide the median line
+        if len(all_error_data[i]) == 0:
+            median.set_visible(False)
+    
+    # Set outlier colors
+    for i, (flier, color) in enumerate(zip(bp['fliers'], colors)):
+        flier.set_markerfacecolor(color)
+        flier.set_markersize(3)
+        
+        # If this box has no data, hide the fliers
+        if len(all_error_data[i]) == 0:
+            flier.set_visible(False)
+    
+    axes[0, 2].set_title('TM Score Errors by True TM Score Interval')
+    axes[0, 2].set_xlabel('True TM Score Interval')
+    axes[0, 2].set_ylabel('TM Score Error')
+    axes[0, 2].set_xlim(0.0, 1.0)  # Proper TM score range
+    
+    # Set x-axis ticks at interval centers with proper labels
+    tick_positions = [0.1, 0.3, 0.5, 0.7, 0.9]  # Centers of intervals
+    tick_labels = ['[0.0,0.2)', '[0.2,0.4)', '[0.4,0.6)', '[0.6,0.8)', '[0.8,1.0]']
+    axes[0, 2].set_xticks(tick_positions)
+    axes[0, 2].set_xticklabels(tick_labels, rotation=45, ha='right')
+    
+    axes[0, 2].axhline(y=0, color='black', linestyle='--', alpha=0.7)
+    
+    # Create legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='orange', alpha=0.7, label='our model'),
+                      Patch(facecolor='cyan', alpha=0.7, label='TM-vec')]
+    axes[0, 2].legend(handles=legend_elements)
+    axes[0, 2].grid(True, alpha=0.3)
     
     # === TM Score Plots ===
-    # TM Error distribution
-    axes[0, 2].hist(results['tm_errors'], bins=50, alpha=0.7, color='orange', edgecolor='black')
-    axes[0, 2].set_title('TM Score Error Distribution')
-    axes[0, 2].set_xlabel('Error')
-    axes[0, 2].set_ylabel('Frequency')
-    axes[0, 2].set_xlim(-0.5, 0.5)
-    axes[0, 2].axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    # TM Error distribution (Siamese vs tm_vec)
+    axes[1, 0].set_xlim(-0.5, 0.5)  # Set x-axis limits first
+    # Create shared bins for consistent bar widths
+    error_bins = np.linspace(-0.5, 0.5, 31)  # 30 bins
+    axes[1, 0].hist(results['tm_errors'], bins=error_bins, alpha=0.4, color='orange', edgecolor='black', label='our model')
+    axes[1, 0].hist(results['tmvec_tm_errors'], bins=error_bins, alpha=0.4, color='cyan', edgecolor='black', label='TM-vec')
+    axes[1, 0].set_title('TM Score Error Distribution')
+    axes[1, 0].set_xlabel('Error')
+    axes[1, 0].set_ylabel('Frequency')
+    axes[1, 0].axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    axes[1, 0].legend()
     
-    # TM Absolute error distribution
-    axes[1, 1].hist(results['tm_abs_errors'], bins=50, alpha=0.7, color='purple', edgecolor='black')
+    # TM Absolute error distribution (Siamese vs tm_vec)
+    axes[1, 1].set_xlim(0, 0.5)  # Set x-axis limits first
+    # Create shared bins for consistent bar widths
+    abs_error_bins = np.linspace(0, 0.5, 31)  # 30 bins
+    axes[1, 1].hist(results['tm_abs_errors'], bins=abs_error_bins, alpha=0.4, color='magenta', edgecolor='black', label='our model')
+    axes[1, 1].hist(results['tmvec_tm_abs_errors'], bins=abs_error_bins, alpha=0.4, color='blue', edgecolor='black', label='TM-vec')
     axes[1, 1].set_title('TM Score Absolute Error Distribution')
     axes[1, 1].set_xlabel('Absolute Error')
     axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_xlim(0, 0.5)
+    axes[1, 1].legend()
     
-    # TM Error vs True score scatter
-    axes[1, 2].scatter(results['true_tm_scores'], results['tm_errors'], alpha=0.5, s=1)
-    axes[1, 2].set_title('TM Error vs True Score')
-    axes[1, 2].set_xlabel('True TM Score')
-    axes[1, 2].set_ylabel('Error')
-    axes[1, 2].axhline(y=0, color='red', linestyle='--', alpha=0.7)
+    # Leave the bottom-right plot empty for TM scores
+    axes[1, 2].set_title('TM Score Analysis')
+    axes[1, 2].text(0.5, 0.5, 'TM Score Analysis\n(Plot removed)', 
+                    ha='center', va='center', transform=axes[1, 2].transAxes, fontsize=12)
+    axes[1, 2].set_xticks([])
+    axes[1, 2].set_yticks([])
     
     plt.tight_layout()
     plt.savefig(f'{output_prefix}_evaluation_results.png', dpi=300, bbox_inches='tight')
     plt.close()
+    # Reset font size to default
+    plt.rcParams.update({'font.size': 10})
     print(f"Saved evaluation plot to: {output_prefix}_evaluation_results.png")
 
 
@@ -383,7 +465,7 @@ def main():
     MODEL_PATH = '07.26-2000parquet.pth'  # Path to trained model checkpoint
     GCS_FOLDER = 'gs://primes-bucket/testing_data2/'  # GCS folder with parquet files
     GCS_PROJECT = 'mit-primes-464001'  # GCS project ID
-    KEY_PATH = None  # Set to None to use default credentials, or path to service account key
+    KEY_PATH = 'mit-primes-464001-bfa03c2c5999.json'  # Path to service account key file
     BATCH_SIZE = 32  # Batch size for evaluation
     MAX_SEQ_LEN = 300  # Maximum sequence length
     OUTPUT_PREFIX = 'evaluation'  # Output prefix for results
@@ -423,7 +505,7 @@ def main():
     t5_model = T5EncoderModel.from_pretrained(MODEL_NAME).to(device)
     t5_model.eval()
     
-    # Create dataset with only first 3 parquet files
+    # Create dataset with limited parquet files
     print(f"Loading dataset from {GCS_FOLDER}...")
     dataset = SiameseParquetDataset(
         gcs_folder=GCS_FOLDER,
@@ -432,16 +514,15 @@ def main():
         key_path=KEY_PATH
     )
     
-    # Limit to only first 3 parquet files
-    MAX_PARQUET_FILES = 3
+    # Limit the number of parquet files
+    MAX_PARQUET_FILES = 10  # Change this number to limit files
     if len(dataset.all_parquet_uris) > MAX_PARQUET_FILES:
-        print(f"Limiting to first {MAX_PARQUET_FILES} parquet files (out of {len(dataset.all_parquet_uris)})")
+        print(f"Limiting to first {MAX_PARQUET_FILES} parquet files out of {len(dataset.all_parquet_uris)} available")
         dataset.all_parquet_uris = dataset.all_parquet_uris[:MAX_PARQUET_FILES]
         # Rebuild the index cache with limited files
         dataset._build_shuffled_index_cache()
     else:
         print(f"Using all {len(dataset.all_parquet_uris)} available parquet files")
-        dataset._build_shuffled_index_cache()
     
     # Create dataloader
     dataloader = torch.utils.data.DataLoader(
@@ -577,6 +658,21 @@ def main():
     results_csv = f"{OUTPUT_PREFIX}_results.csv"
     results_df.to_csv(results_csv, index=False)
     print(f"Saved results to: {results_csv}")
+    
+    # Save predicted vs true TM scores to CSV
+    tm_scores_df = pd.DataFrame({
+        'true_tm_score': results['true_tm_scores'],
+        'predicted_tm_score_siamese': results['predicted_tm_scores'],
+        'predicted_tm_score_tmvec': results['tmvec_tm_scores'],
+        'siamese_error': results['tm_errors'],
+        'tmvec_error': results['tmvec_tm_errors'],
+        'siamese_abs_error': results['tm_abs_errors'],
+        'tmvec_abs_error': results['tmvec_tm_abs_errors']
+    })
+    
+    tm_scores_csv = f"{OUTPUT_PREFIX}_tm_scores.csv"
+    tm_scores_df.to_csv(tm_scores_csv, index=False)
+    print(f"Saved TM scores comparison to: {tm_scores_csv}")
     
     # Create plots
     plot_evaluation_results(results, OUTPUT_PREFIX)

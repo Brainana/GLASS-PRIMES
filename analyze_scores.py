@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from transformers import T5EncoderModel, T5Tokenizer
 from siamese_transformer_model import SiameseTransformerNet
+from siamese_transformer_model_v1 import SiameseTransformerNetV1
 from lddt_weighted import LDDTCalculatorWeighted
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -64,7 +65,7 @@ def load_trained_model(model_path, device):
     """Load the trained Siamese transformer model."""
     siamese_checkpoint = torch.load(model_path, map_location=device)
     siamese_config = siamese_checkpoint['config']
-    siamese_model = SiameseTransformerNet(
+    siamese_model = SiameseTransformerNetV1(
         input_dim=siamese_config['prottrans_dim'],
         hidden_dim=siamese_config['hidden_dim'],
         output_dim=siamese_config['output_dim'],
