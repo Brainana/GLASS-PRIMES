@@ -21,7 +21,7 @@ import os
 import json
 from tqdm import tqdm
 
-from siamese_transformer_model_env import SiameseTransformerNet
+from siamese_transformer_model import SiameseTransformerNet
 from siamese_parquet_dataset_env import SiameseParquetDataset, siamese_collate_fn
 from siamese_loss import TMLDDTLoss
 

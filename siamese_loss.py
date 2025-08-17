@@ -46,14 +46,11 @@ class TMLDDTLoss(torch.nn.Module):
             # Compute cosine similarity for global embeddings
             global_sim = torch.cosine_similarity(global_emb1[i], global_emb2[i], dim=0)
             
-            # Transform cosine similarity from [-1, 1] to [0, 1] range
-            global_sim_normalized = (global_sim + 1) / 2
-            
             # Target similarity based on TM score
             target_sim = torch.tensor(tm_score, device=global_sim.device)
             
             # Global loss (always use TM score)
-            global_loss = torch.nn.functional.l1_loss(global_sim_normalized, target_sim)
+            global_loss = torch.nn.functional.l1_loss(global_sim, target_sim)
             
             # Per-residue loss
             if tm_score >= min_tm_score_for_lddt:
@@ -111,9 +108,6 @@ class TMLDDTLoss(torch.nn.Module):
         # Compute cosine similarities between aligned residues
         similarities = torch.cosine_similarity(aligned_emb1, aligned_emb2, dim=1)
         
-        # Transform cosine similarities from [-1, 1] to [0, 1] range
-        similarities_normalized = (similarities + 1) / 2
-        
-        residue_loss = torch.nn.functional.l1_loss(similarities_normalized, aligned_targets)
+        residue_loss = torch.nn.functional.l1_loss(similarities, aligned_targets)
         
         return residue_loss

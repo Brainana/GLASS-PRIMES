@@ -184,21 +184,6 @@ def evaluate_model(model, dataloader, device, tmvec_model=None, tokenizer=None, 
                     # Extract scores for aligned positions only
                     pred_seq = predicted_scores[i][aligned_positions]
                     true_seq = true_scores[i][aligned_positions]
-                    
-                    # Print predicted and true scores for the first pair
-                    if batch_count == 1 and i == 0:
-                        print(f"=== DEBUG INFO ===")
-                        print(f"TM Score: {tm_scores[i]:.6f}")
-                        print(f"Number of aligned positions: {len(aligned_positions)}")
-                        print(f"True scores shape: {true_scores[i].shape}")
-                        print(f"True scores (first 10): {true_scores[i][:10]}")
-                        print(f"True scores min/max: {true_scores[i].min():.6f}/{true_scores[i].max():.6f}")
-                        print(f"True scores mean: {true_scores[i].mean():.6f}")
-                        print(f"Aligned true scores min/max: {true_seq.min():.6f}/{true_seq.max():.6f}")
-                        print(f"Aligned true scores mean: {true_seq.mean():.6f}")
-                        print(f"Number of zero true scores: {np.sum(true_seq == 0)}")
-                        print(f"Number of non-zero true scores: {np.sum(true_seq != 0)}")
-                        print(f"================================\n")
                         
                     # Compute errors
                     errors = pred_seq - true_seq
