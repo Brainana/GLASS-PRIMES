@@ -72,25 +72,10 @@ class SiameseTransformerNet(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Enhanced weight initialization for better training."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                # Use Xavier initialization for linear layers
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                # Initialize layer norm
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.MultiheadAttention):
-                # Initialize attention weights
-                nn.init.xavier_uniform_(module.in_proj_weight)
-                nn.init.xavier_uniform_(module.out_proj.weight)
-                if module.in_proj_bias is not None:
-                    nn.init.zeros_(module.in_proj_bias)
-                if module.out_proj.bias is not None:
-                    nn.init.zeros_(module.out_proj.bias)
+        """Initialize transformer weights."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
     
     def forward(self, x1, x2, mask1=None, mask2=None):
         """

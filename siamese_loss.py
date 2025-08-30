@@ -37,9 +37,9 @@ class TMLDDTLoss(torch.nn.Module):
         for i in range(batch_size):
             tm_score = tm_scores[i].item()
             
-            # Skip pairs with TM score < min_tm_score_for_global
-            if tm_score < min_tm_score_for_global:
-                continue
+            # # Skip pairs with TM score < min_tm_score_for_global
+            # if tm_score < min_tm_score_for_global:
+            #     continue
             
             valid_pairs += 1
             
