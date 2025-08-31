@@ -293,12 +293,12 @@ def main():
         config = {
             'prottrans_dim': 1024,      # Dimension of ProtTrans embeddings
             'max_seq_len': 300,         # Maximum sequence length for padding
-            'hidden_dim': 1024,         # Hidden dimension of the transformer
+            'hidden_dim': 512,          # Hidden dimension of the transformer
             'output_dim': 512,          # Output dimension of new embeddings
             'nhead': 4,                 # Number of attention heads
             'num_layers': 2,            # Number of transformer layers
             'dropout': 0.1,             # Dropout rate
-            'batch_size': 16,           # Batch size for training
+            'batch_size': 32,           # Batch size for training
             'num_workers': 0,           # Number of workers for data loading
             'num_epochs': 5,            # Number of training epochs
             'learning_rate': 1e-4,      # Learning rate

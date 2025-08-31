@@ -38,7 +38,7 @@ class SiameseTransformerNet(nn.Module):
     Uses self-attention to capture sequence dependencies and local structure patterns.
     Relies on ProtTrans embeddings' inherent positional information.
     """
-    def __init__(self, input_dim, hidden_dim=1024, output_dim=512, 
+    def __init__(self, input_dim, hidden_dim=512, output_dim=512, 
                  nhead=4, num_layers=2, dropout=0.1, max_seq_len=300):                 
         super().__init__()
         self.input_dim = input_dim
@@ -51,7 +51,7 @@ class SiameseTransformerNet(nn.Module):
         
         # Transformer encoder layers
         self.transformer_layers = nn.ModuleList([
-            TransformerEncoderLayer(hidden_dim, nhead, hidden_dim * 2, dropout)
+            TransformerEncoderLayer(hidden_dim, nhead, hidden_dim * 4, dropout)
             for _ in range(num_layers)
         ])
         
