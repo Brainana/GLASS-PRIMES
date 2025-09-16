@@ -85,9 +85,9 @@ def plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_pred
     
     # === TM Score Plots ===
     # TM Error distribution (Siamese vs tm_vec)
-    axes[1, 0].set_xlim(-0.3, 0.3)  # Set x-axis limits first
+    axes[1, 0].set_xlim(-0.1, 0.1)  # Set x-axis limits first
     # Create shared bins for consistent bar widths
-    error_bins = np.linspace(-0.3, 0.3, 31)  # 30 bins
+    error_bins = np.linspace(-0.1, 0.1, 31)  # 30 bins
     axes[1, 0].hist(all_tm_errors, bins=error_bins, alpha=0.4, color='orange', edgecolor='black', label='our model')
     axes[1, 0].hist(all_tmvec_errors, bins=error_bins, alpha=0.4, color='cyan', edgecolor='black', label='TM-vec')
     axes[1, 0].set_title('TM Score Error Distribution')
@@ -97,9 +97,9 @@ def plot_loss_distribution(all_errors, all_abs_errors, all_true_scores, all_pred
     axes[1, 0].legend()
     
     # TM Absolute error distribution (Siamese vs tm_vec)
-    axes[1, 1].set_xlim(0, 0.3)  # Set x-axis limits first
+    axes[1, 1].set_xlim(0, 0.1)  # Set x-axis limits first
     # Create shared bins for consistent bar widths
-    abs_error_bins = np.linspace(0, 0.3, 31)  # 30 bins
+    abs_error_bins = np.linspace(0, 0.1, 31)  # 30 bins
     axes[1, 1].hist(all_tm_abs_errors, bins=abs_error_bins, alpha=0.4, color='magenta', edgecolor='black', label='our model')
     axes[1, 1].hist(all_tmvec_abs_errors, bins=abs_error_bins, alpha=0.4, color='blue', edgecolor='black', label='TM-vec')
     axes[1, 1].set_title('TM Score Absolute Error Distribution')
@@ -163,7 +163,7 @@ def main():
             # Parse lDDT scores
             predicted_lddt_scores = parse_score_list(row.get('predicted_lddt_scores', []))
             true_lddt_scores = parse_score_list(row.get('true_lddt_scores', []))
-            
+ 
             if not predicted_lddt_scores or not true_lddt_scores:
                 print(f"  Skipping: missing lDDT scores")
                 continue

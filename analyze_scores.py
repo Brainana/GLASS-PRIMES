@@ -65,7 +65,7 @@ def load_trained_model(model_path, device):
     """Load the trained Siamese transformer model."""
     siamese_checkpoint = torch.load(model_path, map_location=device)
     siamese_config = siamese_checkpoint['config']
-    siamese_model = SiameseTransformerNetV1(
+    siamese_model = SiameseTransformerNet(
         input_dim=siamese_config['prottrans_dim'],
         hidden_dim=siamese_config['hidden_dim'],
         output_dim=siamese_config['output_dim'],
