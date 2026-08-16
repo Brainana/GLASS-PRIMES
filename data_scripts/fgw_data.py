@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
 
-import csv
 import os
 import sys
 
 import numpy as np
 import pandas as pd
 
+from common import (
+    build_parser,
+    embedding_path,
+    log_failures,
+    open_appending_writer,
+    pdb_path,
+    read_done_rows,
+    write_progress,
+    write_run_manifest,
+)
 from fgw import compute_fgw_from_features
 from parse_pdb import parse_pdb
+from patches import K_NEIGHBORS, knn_indices
 
 # global config
 TM_DATA_CSV = "/jet/home/jxu23/OCEANDIR/tm_scores.csv"
 PDB_DIR = "/jet/home/jxu23/OCEANDIR/pdbs"
 EMBEDDING_DIR = "/jet/home/jxu23/OCEANDIR/embeddings"
 OUTPUT_CSV = "/jet/home/jxu23/OCEANDIR/fgw_scores.csv"
+PROGRESS_FILE = "/jet/home/jxu23/OCEANDIR/fgw_data_progress.txt"
 
 START_ROW = 0
-END_ROW = 50
+END_ROW = 50000
 CSV_CHUNK_SIZE = 1000
 FLUSH_EVERY_ROWS = 10
-K_NEIGHBORS = 32
+ALIGNED_RESIDUE_STRIDE = 32  # K_NEIGHBORS now comes from patches.py
 ALPHA = 0.7
 EPS = 0.05
 SINKHORN_ITER = 30
 STRUCTURE_EXP_SCALE = 0.1
 
 SEQM_VALUES = {":", ".", " "}
-
-
-def pdb_path(uniprot_id: str) -> str:
-    return os.path.join(PDB_DIR, f"{uniprot_id}.pdb")
-
-
-def embedding_path(uniprot_id: str) -> str:
-    return os.path.join(EMBEDDING_DIR, f"{uniprot_id}.npy")
 
 
 def compute_local_fgw(
@@ -54,12 +57,6 @@ def compute_local_fgw(
         structure_exp_scale=STRUCTURE_EXP_SCALE,
         return_components=True,
     )
-
-
-def knn_indices(coords: np.ndarray, residue_idx: int) -> np.ndarray:
-    distances = np.linalg.norm(coords - coords[residue_idx], axis=1)
-    k = min(K_NEIGHBORS, len(coords))
-    return np.argsort(distances)[:k]
 
 
 def iter_aligned_residue_pairs(seqxA: str, seqM: str, seqyA: str):
@@ -87,11 +84,11 @@ def iter_aligned_residue_pairs(seqxA: str, seqM: str, seqyA: str):
 
 
 def load_protein_data(uniprot_id: str):
-    pdb_file = pdb_path(uniprot_id)
+    pdb_file = pdb_path(PDB_DIR, uniprot_id)
     if not os.path.exists(pdb_file):
         raise FileNotFoundError(pdb_file)
 
-    embedding_file = embedding_path(uniprot_id)
+    embedding_file = embedding_path(EMBEDDING_DIR, uniprot_id)
     if not os.path.exists(embedding_file):
         raise FileNotFoundError(embedding_file)
 
@@ -109,35 +106,28 @@ def load_protein_data(uniprot_id: str):
     return coords, sequence, embeddings
 
 
-def input_rows(csv_path: str):
-    start_row = 0 if START_ROW is None else START_ROW
-    end_row = END_ROW
-    current_row = 0
+def input_rows(csv_path: str, start_row, end_row, skip_source_rows=frozenset()):
+    """Stream tm_scores.csv rows whose SOURCE parquet row is in the window."""
+    start_row = 0 if start_row is None else start_row
+    line_no = 0
 
     for df_chunk in pd.read_csv(
         csv_path,
         chunksize=CSV_CHUNK_SIZE,
         keep_default_na=False,
     ):
-        chunk_start = current_row
-        chunk_end = current_row + len(df_chunk)
+        for _, row in df_chunk.iterrows():
+            source_row = int(row["row"]) if "row" in row else line_no
+            line_no += 1
 
-        if chunk_end <= start_row:
-            current_row = chunk_end
-            continue
-        if end_row is not None and chunk_start >= end_row:
-            return
+            if source_row < start_row:
+                continue
+            if end_row is not None and source_row >= end_row:
+                continue
+            if source_row in skip_source_rows:
+                continue
 
-        local_start = max(start_row - chunk_start, 0)
-        local_end = len(df_chunk)
-        if end_row is not None:
-            local_end = min(end_row - chunk_start, len(df_chunk))
-
-        selected_rows = df_chunk.iloc[local_start:local_end]
-        for offset, (_, row) in enumerate(selected_rows.iterrows()):
-            yield chunk_start + local_start + offset, row
-
-        current_row = chunk_end
+            yield source_row, row
 
 
 def output_fields():
@@ -208,37 +198,45 @@ def process_tm_row(row, input_row_idx, writer):
     seqM = str(row["seqM"])
     seqyA = str(row["seqyA"])
 
-    scored_pairs = 0
-    for residue_pair in iter_aligned_residue_pairs(seqxA, seqM, seqyA):
+    pending = []
+    for aligned_pair_idx, residue_pair in enumerate(
+        iter_aligned_residue_pairs(seqxA, seqM, seqyA)
+    ):
+        if aligned_pair_idx % ALIGNED_RESIDUE_STRIDE != 0:
+            continue
+
         _, residue_idx1, residue_idx2, _, _, _ = residue_pair
 
         indices1 = knn_indices(coords1, residue_idx1)
         indices2 = knn_indices(coords2, residue_idx2)
 
-        fgw_score, structure_term, feature_term = compute_local_fgw(
+        fgw_distance, structure_term, feature_term = compute_local_fgw(
             coords1[indices1],
             coords2[indices2],
             embeddings1[indices1],
             embeddings2[indices2],
         )
+        fgw_score = 1 - fgw_distance
 
-        write_result(
-            writer,
-            row,
-            input_row_idx,
-            residue_pair,
-            fgw_score,
-            structure_term,
-            feature_term,
-            len(indices1),
-            len(indices2),
+        pending.append(
+            (residue_pair, fgw_score, structure_term, feature_term,
+             len(indices1), len(indices2))
         )
-        scored_pairs += 1
 
-    return scored_pairs
+    for residue_pair, score, struct, feat, n1, n2 in pending:
+        write_result(writer, row, input_row_idx, residue_pair, score, struct, feat, n1, n2)
+
+    return len(pending)
 
 
 def main():
+    args = build_parser(
+        "Compute local FGW scores for TM-aligned pairs in a parquet row window.",
+        START_ROW,
+        END_ROW,
+    ).parse_args()
+    start_row, end_row = args.start_row, args.end_row
+
     if not os.path.exists(TM_DATA_CSV):
         print(f"Error: TM data CSV not found: {TM_DATA_CSV}", file=sys.stderr)
         sys.exit(1)
@@ -255,28 +253,30 @@ def main():
     print(f"TM data: {TM_DATA_CSV}")
     print(f"PDB dir: {PDB_DIR}")
     print(f"Embedding dir: {EMBEDDING_DIR}")
-    print(f"Rows: [{START_ROW}, {END_ROW if END_ROW is not None else 'EOF'})")
+    print(f"Source rows: [{start_row}, {end_row if end_row is not None else 'EOF'})")
     print(f"CSV chunk size: {CSV_CHUNK_SIZE}")
     print(f"Flush every rows: {FLUSH_EVERY_ROWS}")
     print(f"k-NN size: {K_NEIGHBORS}")
+    print(f"Aligned residue stride: {ALIGNED_RESIDUE_STRIDE}")
     print(f"Structure exp scale: {STRUCTURE_EXP_SCALE}")
     print(f"Output: {OUTPUT_CSV}")
 
-    output_dir = os.path.dirname(OUTPUT_CSV)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    skip_source_rows = (
+        frozenset() if args.no_resume else read_done_rows(OUTPUT_CSV, "source_row")
+    )
+    if skip_source_rows:
+        print(f"Resume: {len(skip_source_rows)} pairs already scored, skipping them")
 
-    write_header = not os.path.exists(OUTPUT_CSV) or os.path.getsize(OUTPUT_CSV) == 0
     total_pairs = 0
-    failed_rows = 0
+    failures = []
     rows_since_flush = 0
+    last_row_processed = None
 
-    with open(OUTPUT_CSV, "a", newline="") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=output_fields())
-        if write_header:
-            writer.writeheader()
-
-        for input_row_idx, row in input_rows(TM_DATA_CSV):
+    output_file, writer = open_appending_writer(OUTPUT_CSV, output_fields())
+    with output_file:
+        for input_row_idx, row in input_rows(
+            TM_DATA_CSV, start_row, end_row, skip_source_rows
+        ):
             try:
                 scored_pairs = process_tm_row(
                     row,
@@ -291,19 +291,38 @@ def main():
                 rows_since_flush += 1
                 if rows_since_flush >= FLUSH_EVERY_ROWS:
                     output_file.flush()
+                    write_progress(PROGRESS_FILE, input_row_idx)
                     rows_since_flush = 0
             except Exception as exc:
-                failed_rows += 1
+                failures.append(exc)
                 print(
                     f"[row {input_row_idx}] skipped ({exc})",
                     file=sys.stderr,
                 )
+            finally:
+                last_row_processed = input_row_idx
 
         output_file.flush()
+        if last_row_processed is not None:
+            write_progress(PROGRESS_FILE, last_row_processed)
 
     print("-" * 60)
-    print(f"Done. Local FGW scores: {total_pairs}, failed rows: {failed_rows}")
+    print(f"Done. Local FGW scores: {total_pairs}")
+    log_failures(failures, total_pairs + len(failures))
     print(f"Results saved to: {os.path.abspath(OUTPUT_CSV)}")
+    manifest = write_run_manifest(
+        OUTPUT_CSV,
+        {
+            "stage": "fgw_data",
+            "start_row": start_row,
+            "end_row": end_row,
+            "scores_written": total_pairs,
+            "failed": len(failures),
+            "resumed_skips": len(skip_source_rows),
+            "last_row_processed": last_row_processed,
+        },
+    )
+    print(f"Run recorded in: {manifest}")
 
 
 if __name__ == "__main__":

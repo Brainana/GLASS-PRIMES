@@ -1,2 +1,21 @@
 node_modules/
 __pycache__/tm_vec/tm_vec_swiss_model.ckpt
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# large data -- GitHub hard-rejects files over 100 MB
+data/
+*.parquet
+*.npy
+*.pt
+*.ckpt
+
+# generated pipeline outputs
+*.runs.jsonl
+*_progress.txt
+
+# macOS
+.DS_Store

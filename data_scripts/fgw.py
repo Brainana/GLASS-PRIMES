@@ -1,6 +1,6 @@
 import numpy as np
+
 from parse_pdb import parse_pdb
-from embed_esm2 import get_esm_embeddings, load_esm
 
 # computes the pairwise distance matrix
 
@@ -17,8 +17,10 @@ def cosine_feature_dist(F1, F2):
 
 
 def normalize_cost_matrix(C):
-    mean_cost = np.mean(C[C > 0])
-    return C / mean_cost
+    positive = C[C > 0]
+    if positive.size == 0:
+        return C
+    return C / np.mean(positive)
 
 
 def exponential_scaled_distance(value, scale):
@@ -37,7 +39,7 @@ def sinkhorn(C, a, b, eps=0.05, n_iter=30):
         u = a / (K @ v + 1e-9)
         v = b / (K.T @ u + 1e-9)
 
-    return np.diag(u) @ K @ np.diag(v)
+    return u[:, None] * K * v[None, :]
 
 # computes the FGW loss based off both the structure and the features
 
@@ -85,9 +87,11 @@ def compute_fgw_from_features(
         alpha=0.7,
         eps=0.05,
         sinkhorn_iter=30,
+        inner_sinkhorn_iter=20,
         normalize=True,
         structure_exp_scale=None,
         return_components=False):
+    """sinkhorn_iter is the outer FGW loop; inner_sinkhorn_iter the inner one."""
     C1 = pairwise_dist(X)
     C2 = pairwise_dist(Y)
     M_feat = cosine_feature_dist(F1, F2)
@@ -106,7 +110,7 @@ def compute_fgw_from_features(
     for _ in range(sinkhorn_iter):
         M_geom = fgw_cost_matrix(C1, C2, T)
         C = alpha * M_geom + (1 - alpha) * M_feat
-        T = sinkhorn(C, a, b, eps=eps, n_iter=20)
+        T = sinkhorn(C, a, b, eps=eps, n_iter=inner_sinkhorn_iter)
 
     term_struct, term_feat = fgw_terms(C1, C2, F1, F2, T, D_feat=M_feat)
     if structure_exp_scale is not None:
@@ -129,8 +133,10 @@ def compute_fgw(pdb1, pdb2,
                 batch_converter=None,
                 normalize=True,
                 structure_exp_scale=None):
+    from embed_esm2 import get_esm_embeddings, load_esm
+
     if model is None or batch_converter is None:
-        model, _, batch_converter = load_esm()
+        model, _, batch_converter = load_esm(device=device)
 
     # load structures
     X, seq1 = parse_pdb(pdb1)
@@ -151,13 +157,3 @@ def compute_fgw(pdb1, pdb2,
         normalize=normalize,
         structure_exp_scale=structure_exp_scale,
     )
-
-
-if __name__ == "__main__":
-    pdb1 = "proteinA.pdb"
-    pdb2 = "proteinB.pdb"
-
-    model, _, batch_converter = load_esm()
-    score = compute_fgw(pdb1, pdb2, model=model, batch_converter=batch_converter)
-
-    print("FGW distance:", score)

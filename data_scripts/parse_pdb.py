@@ -19,7 +19,7 @@ def parse_pdb(pdb_path):
     coords = []
     sequence = []
 
-    for model in structure:
+    for model in list(structure)[:1]:
         for chain in model:
             for res in chain:
                 if res.id[0] != " ":

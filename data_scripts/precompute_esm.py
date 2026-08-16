@@ -8,6 +8,15 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
+from common import (
+    build_parser,
+    embedding_path,
+    iter_row_groups,
+    log_failures,
+    pdb_path,
+    write_progress,
+    write_run_manifest,
+)
 from embed_esm2 import get_esm_embeddings, load_esm
 from parse_pdb import parse_pdb
 
@@ -24,17 +33,9 @@ END_ROW = 100000
 COL1 = "chain_1"
 COL2 = "chain_2"
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAVE_DTYPE = np.float16
 MAX_SEQUENCE_LENGTH = 1000
-
-
-def pdb_path(uniprot_id: str) -> str:
-    return os.path.join(PDB_DIR, f"{uniprot_id}.pdb")
-
-
-def embedding_path(uniprot_id: str) -> str:
-    return os.path.join(EMBEDDING_DIR, f"{uniprot_id}.npy")
 
 
 def valid_id(value) -> bool:
@@ -42,44 +43,30 @@ def valid_id(value) -> bool:
     return protein_id != "" and protein_id.lower() != "nan"
 
 
-def sequence_too_long(protein_id: str, sequence: str) -> bool:
-    if MAX_SEQUENCE_LENGTH is None:
-        return False
-
-    if len(sequence) <= MAX_SEQUENCE_LENGTH:
-        return False
-
-    print(
-        f"{protein_id}: sequence length {len(sequence)} exceeds "
-        f"MAX_SEQUENCE_LENGTH={MAX_SEQUENCE_LENGTH}",
-        file=sys.stderr,
-    )
-    return True
-
-
-def iter_unique_protein_ids(parquet_path: str, progress=None):
+def iter_unique_protein_ids(parquet_path: str, start_row, end_row, progress=None):
     parquet_file = pq.ParquetFile(parquet_path)
     total_rows = parquet_file.metadata.num_rows
 
-    start_row = 0 if START_ROW is None else START_ROW
-    end_row = total_rows if END_ROW is None else min(END_ROW, total_rows)
+    start_row = 0 if start_row is None else start_row
+    end_row = total_rows if end_row is None else min(end_row, total_rows)
 
     seen = set()
-    current_global_row = 0
 
-    for row_group_idx in range(parquet_file.num_row_groups):
+    for row_group_idx, group_start in iter_row_groups(
+        parquet_file, start_row, end_row
+    ):
         table = parquet_file.read_row_group(row_group_idx, columns=[COL1, COL2])
         df_chunk = table.to_pandas()
 
         for local_idx, (_, row) in enumerate(df_chunk.iterrows()):
-            global_row_idx = current_global_row + local_idx
-            if progress is not None:
-                progress["last_row_processed"] = global_row_idx
+            global_row_idx = group_start + local_idx
 
             if global_row_idx < start_row:
                 continue
             if global_row_idx >= end_row:
                 return
+            if progress is not None:
+                progress["last_row_processed"] = global_row_idx
 
             id1 = str(row[COL1]).strip()
             id2 = str(row[COL2]).strip()
@@ -90,32 +77,11 @@ def iter_unique_protein_ids(parquet_path: str, progress=None):
                 )
                 continue
 
-            try:
-                _, seq1 = load_sequence(id1)
-                _, seq2 = load_sequence(id2)
-            except Exception as exc:
-                print(
-                    f"[row {global_row_idx}] {id1} vs {id2}: "
-                    f"skipping pair ({exc})",
-                    file=sys.stderr,
-                )
-                continue
-
-            if sequence_too_long(id1, seq1) or sequence_too_long(id2, seq2):
-                print(
-                    f"[row {global_row_idx}] {id1} vs {id2}: "
-                    "skipping both proteins",
-                    file=sys.stderr,
-                )
-                continue
-
             for protein_id in (id1, id2):
                 if protein_id in seen:
                     continue
                 seen.add(protein_id)
                 yield protein_id
-
-        current_global_row += len(df_chunk)
 
 
 def manifest_fields():
@@ -137,24 +103,15 @@ def write_manifest_row(writer, protein_id, sequence_length, shape, status, error
             "sequence_length": sequence_length,
             "embedding_shape": "x".join(str(dim) for dim in shape),
             "embedding_dtype": str(np.dtype(SAVE_DTYPE)),
-            "embedding_path": embedding_path(protein_id),
+            "embedding_path": embedding_path(EMBEDDING_DIR, protein_id),
             "status": status,
             "error": error,
         }
     )
 
 
-def write_progress(row_idx):
-    progress_dir = os.path.dirname(PROGRESS_FILE)
-    if progress_dir:
-        os.makedirs(progress_dir, exist_ok=True)
-
-    with open(PROGRESS_FILE, "w") as progress_file:
-        progress_file.write(str(row_idx))
-
-
 def save_embedding(protein_id: str, embedding: np.ndarray):
-    final_path = embedding_path(protein_id)
+    final_path = embedding_path(EMBEDDING_DIR, protein_id)
     tmp_path = f"{final_path}.tmp"
 
     embedding = embedding.astype(SAVE_DTYPE)
@@ -165,7 +122,7 @@ def save_embedding(protein_id: str, embedding: np.ndarray):
 
 
 def load_sequence(protein_id: str):
-    path = pdb_path(protein_id)
+    path = pdb_path(PDB_DIR, protein_id)
     if not os.path.exists(path):
         raise FileNotFoundError(path)
 
@@ -202,6 +159,13 @@ def compute_and_save_embedding(protein_id: str, model, batch_converter):
 
 
 def main():
+    args = build_parser(
+        "Precompute ESM-2 per-residue embeddings for a parquet row window.",
+        START_ROW,
+        END_ROW,
+    ).parse_args()
+    start_row, end_row = args.start_row, args.end_row
+
     if not os.path.exists(PARQUET_PATH):
         print(f"Error: parquet file not found: {PARQUET_PATH}", file=sys.stderr)
         sys.exit(1)
@@ -219,17 +183,17 @@ def main():
     print(f"Embedding dir: {EMBEDDING_DIR}")
     print(f"Manifest: {MANIFEST_CSV}")
     print(f"Progress file: {PROGRESS_FILE}")
-    print(f"Rows: [{START_ROW}, {END_ROW if END_ROW is not None else 'EOF'})")
+    print(f"Rows: [{start_row}, {end_row if end_row is not None else 'EOF'})")
     print(f"Max sequence length: {MAX_SEQUENCE_LENGTH}")
     print(f"Device: {DEVICE}")
     print(f"Save dtype: {np.dtype(SAVE_DTYPE)}")
 
-    model, _, batch_converter = load_esm()
+    model, _, batch_converter = load_esm(device=DEVICE)
 
     write_header = not os.path.exists(MANIFEST_CSV)
     processed = 0
     skipped_existing = 0
-    failed = 0
+    failures = []
     progress = {"last_row_processed": None}
 
     with open(MANIFEST_CSV, "a", newline="") as manifest_file:
@@ -237,10 +201,12 @@ def main():
         if write_header:
             writer.writeheader()
 
-        for protein_id in iter_unique_protein_ids(PARQUET_PATH, progress=progress):
-            final_path = embedding_path(protein_id)
+        for protein_id in iter_unique_protein_ids(
+            PARQUET_PATH, start_row, end_row, progress=progress
+        ):
+            final_path = embedding_path(EMBEDDING_DIR, protein_id)
 
-            if os.path.exists(final_path):
+            if os.path.exists(final_path) and not args.no_resume:
                 skipped_existing += 1
                 print(f"{protein_id}: exists, skipping")
                 continue
@@ -264,17 +230,11 @@ def main():
                 if "out of memory" in str(exc).lower() and DEVICE == "cuda":
                     torch.cuda.empty_cache()
 
-                failed += 1
-                try:
-                    _, failed_sequence = load_sequence(protein_id)
-                    failed_sequence_length = len(failed_sequence)
-                except Exception:
-                    failed_sequence_length = 0
-
+                failures.append(exc)
                 write_manifest_row(
                     writer,
                     protein_id,
-                    sequence_length=failed_sequence_length,
+                    sequence_length=0,
                     shape=(),
                     status="failed",
                     error=str(exc),
@@ -284,15 +244,26 @@ def main():
             manifest_file.flush()
 
     print("-" * 60)
-    print(
-        f"Done. Saved: {processed}, "
-        f"skipped existing: {skipped_existing}, failed: {failed}"
-    )
+    print(f"Done. Saved: {processed}, skipped existing: {skipped_existing}")
+    log_failures(failures, processed + len(failures))
     print(f"Last row processed: {progress['last_row_processed']}")
     if progress["last_row_processed"] is not None:
-        write_progress(progress["last_row_processed"])
+        write_progress(PROGRESS_FILE, progress["last_row_processed"])
     print(f"Embeddings saved to: {os.path.abspath(EMBEDDING_DIR)}")
     print(f"Manifest saved to: {os.path.abspath(MANIFEST_CSV)}")
+    run_manifest = write_run_manifest(
+        MANIFEST_CSV,
+        {
+            "stage": "precompute_esm",
+            "start_row": start_row,
+            "end_row": end_row,
+            "embeddings_written": processed,
+            "skipped_existing": skipped_existing,
+            "failed": len(failures),
+            "last_row_processed": progress["last_row_processed"],
+        },
+    )
+    print(f"Run recorded in: {run_manifest}")
 
 
 if __name__ == "__main__":
